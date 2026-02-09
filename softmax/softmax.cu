@@ -1,5 +1,6 @@
 #include <chrono>
 #include <iostream>
+#include <cub/block/block_reduce.cuh>
 
 void softmax_forward_cpu(float* out, const float* in, int N, int C) {
     for (int i = 0; i < N; ++i) {
@@ -206,6 +207,51 @@ __global__ void softmax_forward_kernel_4(float* out, const float* in, int N, int
     }
 }
 
+template<int BLOCK_DIM>
+__global__ void softmax_forward_kernel_5(float* __restrict__ out, const float* __restrict__ in, int N, int C) {
+    using BlockReduce = cub::BlockReduce<float, BLOCK_DIM>;
+    __shared__ typename BlockReduce::TempStorage temp;
+    __shared__ float shared_val;
+
+    const float* in_row = in + blockIdx.x * C;
+    float* out_row = out + blockIdx.x * C;
+
+    // 每个线程求自己负责的局部最大值
+    float max = -INFINITY;
+    for (int i = threadIdx.x; i < C; i += blockDim.x) {
+        max = fmaxf(max, in_row[i]);
+    }
+    // 块级规约求全局最大值
+    max = BlockReduce(temp).Reduce(max, cub::Max());
+    // 通过块内共享变量，将全局最大值由 thread 0 广播到块内所有线程
+    if (threadIdx.x == 0) {
+        shared_val = max;
+    }
+    __syncthreads();
+    max = shared_val;
+
+    // 块级规约进行全局求和
+    // 每个线程对自己负责的值更新: 减去全局最大值 x = (x - max)，以至于 exp 后数值稳定，并进行局部求和
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < C; i += blockDim.x) {
+        float exp_val = expf(in_row[i] - max);
+        sum += exp_val;
+        out_row[i] = exp_val;
+    }
+    // 通过块内共享变量，将全局和由 thread 0 广播到块内所有线程
+    sum = BlockReduce(temp).Reduce(sum, cub::Sum());
+    if (threadIdx.x == 0) {
+        shared_val = sum;
+    }
+    __syncthreads();
+    sum = shared_val;
+    
+    // 每个线程对自己负责的值更新: 除以全局和，即 softmax(x) = e^{-x} / sum(e^{-x})
+    for (int i = threadIdx.x; i < C; i += blockDim.x) {
+        out_row[i] /= sum;
+    }
+}
+
 bool compare_results(const float* cpu, const float* gpu, int N, int C, float eps = 1e-3f) {
     for (int i = 0; i < N * C; ++i) {
         if (fabs(cpu[i] - gpu[i]) > eps) {
@@ -260,10 +306,10 @@ int main() {
     // constexpr int thread_num = 1;
     // softmax_forward_kernel_1<<<block_num, thread_num>>>(d_out, d_in, N, C);
 
-    constexpr int block_num = N;
-    constexpr int thread_num = 512;
-    constexpr int shared_size = thread_num * sizeof(float);
-    softmax_forward_kernel_2<<<block_num, thread_num, shared_size>>>(d_out, d_in, N, C);
+    // constexpr int block_num = N;
+    // constexpr int thread_num = 512;
+    // constexpr int shared_size = thread_num * sizeof(float);
+    // softmax_forward_kernel_2<<<block_num, thread_num, shared_size>>>(d_out, d_in, N, C);
 
     // constexpr int block_num = N;
     // constexpr int thread_num = 32;
@@ -273,6 +319,10 @@ int main() {
     // constexpr int thread_num = 512;
     // constexpr int shared_size = (thread_num / 32) * sizeof(float) * 2;
     // softmax_forward_kernel_4<<<block_num, thread_num, shared_size>>>(d_out, d_in, N, C);
+
+    constexpr int block_num = N;
+    constexpr int thread_num = 512;
+    softmax_forward_kernel_5<thread_num><<<block_num, thread_num>>>(d_out, d_in, N, C);
     cudaEventRecord(stop);
 
     // Wait for the event to complete
