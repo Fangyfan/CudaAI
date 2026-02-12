@@ -1,6 +1,7 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
+#include <iomanip>  // for setprecision
 #include <cmath>    // for fabsf
 #include <fstream>  // for CSV output
 #include <iostream>
@@ -20,39 +21,39 @@ void checkCublasError(cublasStatus_t status, const char* msg) {
     }
 }
 
-#define BLOCK_SIZE 32
-
 // C[M, N] = A[M, K] × B[K, N]
+template<int BM, int BN, int BK>
 __global__ void mysgemm_v2(int M, int N, int K, float alpha, float* A, float* B, float beta, float* C) {
-    int bx = blockIdx.x;
-    int by = blockIdx.y;
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
+    int bx = blockIdx.x; // 当前 Block 在 x 方向的编号 [0, 31]
+    int by = blockIdx.y; // 当前 Block 在 y 方向的编号 [0, 31]
+    int tx = threadIdx.x; // 当前 Block 内该线程在 x 方向的编号 [0, 31]
+    int ty = threadIdx.y; // 当前 Block 内该线程在 y 方向的编号 [0, 31]
+
+    __shared__ float As[BM][BK]; // tile size = (32, 32)
+    __shared__ float Bs[BK][BN]; // tile size = (32, 32)
+
+    A = &A[by * BM * K]; // A[M, K] 中 tile 的左上角 y 坐标为 by * BM，则一维偏移量就是 by * BM * K
+    B = &B[bx * BN]; 	 // B[K, N] 中 tile 的左上角 x 坐标为 bx * BN，则一维偏移量就是 bx * BN
     
-    constexpr int BM = BLOCK_SIZE;
-    constexpr int BN = BLOCK_SIZE;
-    constexpr int BK = BLOCK_SIZE;
-
-    __shared__ float As[BM][BK];
-    __shared__ float Bs[BK][BN];
-
-    A = &A[by * BM * K];
-    B = &B[bx * BN];
+    // C[M, N] 中 tile 的左上角 y 坐标为 by * BM，x 坐标为 bx * BN
+    // 则一维偏移量就是 by * BM * N + bx * BN
     C = &C[by * BM * N + bx * BN];
 
+    // 枚举每个 tile，计算部分和，然后汇总
     float sum = 0.0f;
     for (int k = 0; k < K; k += BK) {
-        As[ty][tx] = A[ty * K + tx];
-        Bs[ty][tx] = B[ty * N + tx];
-        __syncthreads();
+        As[ty][tx] = A[ty * K + tx]; // As[ty][tx] <- A[ty][tx]
+        Bs[ty][tx] = B[ty * N + tx]; // Bs[ty][tx] <- B[ty][tx]
+        __syncthreads(); // block 内同步，确保共享内存 As 和 Bs 搬运完成
 
-        A += BK;
-        B += BK * N;
+        A += BK; 	 // As 向右移动一个 tile，一维偏移量增加 BK
+        B += BK * N; // Bs 向下移动一个 tile，一维偏移量增加 BK * N
 
-        for (int i = 0; i < BK; ++i) {
+#pragma unroll
+        for (int i = 0; i < BK; ++i) { // 遍历 tile 内部元素，计算部分点积
             sum += As[ty][i] * Bs[i][tx];
         }
-        __syncthreads();
+        __syncthreads(); // block 内同步，读取共享内存 As 和 Bs 完成，不要和搬运冲突
     }
     C[ty * N + tx] = alpha * sum + beta * C[ty * N + tx];
 }
@@ -62,7 +63,7 @@ int main() {
 
     // 打开 csv 文件
     std::ofstream ofs("sgemm_benchmark_v2.csv");
-    ofs << "Size,CUBLAS_GFLOPS,MySGEMM_FLOPS,Matched" << std::endl;
+    ofs << "Size,CUBLAS_GFLOPS,MySGEMM_FLOPS,UnMatched,Ratio" << std::endl;
 
     for (int N : sizes) {
         std::cout << "Testing size: " << N << std::endl;
@@ -85,8 +86,9 @@ int main() {
         
         // 初始化输入矩阵 A 和 B
         for (int i = 0; i < N * N; ++i) {
-            A[i] = 1.0f;
-            B[i] = 2.0f;
+            // 生成 0.0 到 1.0 之间的随机浮点数
+            A[i] = (float)rand() / RAND_MAX;
+            B[i] = (float)rand() / RAND_MAX;
         }
 
         try {
@@ -127,15 +129,18 @@ int main() {
             // mysgemm v2
             checkCudaError(cudaMemset(d_C_v2, 0, size), "cudaMemset d_C_v2 failed");
 
-            // 设定每个 Block 是二维的: 32 x 32 = 1024 个线程
-            dim3 thread_num(BLOCK_SIZE, BLOCK_SIZE);
-
-            // 计算需要多少个 Block 才能覆盖整个矩阵
-            dim3 block_num((N + thread_num.x - 1) / thread_num.x, (N + thread_num.y - 1) / thread_num.y);
+            // 每个 Block 负责计算 C 矩阵的一个 tile: 32 × 32
+            constexpr int BN = 32;
+            constexpr int BM = 32;
+            // 每个 thread 计算 C 矩阵中的一个值
+            // 每个 Block 是二维的: (32 / 1) x (32 / 1) = 32 × 32 = 1024 个线程
+            dim3 blockDim(BN, BM);
+            // 计算至少要多少个 Block 才能覆盖 N × N 完整的 C 矩阵
+            dim3 gridDim((N + BN - 1) / BN, (N + BM - 1) / BM);
 
             // warm up
             for (int i = 0; i < warmup_times; ++i) {
-                mysgemm_v2<<<block_num, thread_num>>>(N, N, N, alpha, d_A, d_B, beta, d_C_v2);
+                mysgemm_v2<32, 32, 32><<<gridDim, blockDim>>>(N, N, N, alpha, d_A, d_B, beta, d_C_v2);
             }
             cudaDeviceSynchronize();
 
@@ -143,7 +148,7 @@ int main() {
             float v2_time_ms = 0.0f;
             checkCudaError(cudaEventRecord(start), "v2 cudaEventRecord(start) failed");
             for (int i = 0; i < repeat_times; ++i) {
-                mysgemm_v2<<<block_num, thread_num>>>(N, N, N, alpha, d_A, d_B, beta, d_C_v2);
+                mysgemm_v2<32, 32, 32><<<gridDim, blockDim>>>(N, N, N, alpha, d_A, d_B, beta, d_C_v2);
             }
             checkCudaError(cudaEventRecord(end), "v2 cudaEventRecord(end) failed");
             checkCudaError(cudaEventSynchronize(end), "v2 cudaEventSynchronize(end) failed");
@@ -154,10 +159,27 @@ int main() {
 
             // 结果比较
             int error_count = 0;
-            for (int i = 0; i < N * N && error_count < 10; ++i) {
-                if (fabsf(C_cublas[i] - C_v2[i]) > 1e-5) {
-                    ++error_count;
+            float max_rel_err = 0.0f; // 用于记录最大相对误差
+            for (int i = 0; i < N * N; ++i) {
+                float ref = C_cublas[i];
+                float val = C_v2[i];
+                float diff = fabsf(ref - val);
+                
+                // 相对误差公式： |diff| / |ref|
+                // 添加一个小量 1e-7 防止除以 0
+                float rel_err = diff / (fabsf(ref) + 1e-7f);
+                
+                if (rel_err > max_rel_err) {
+                    max_rel_err = rel_err;
                 }
+
+                // 允许 1e-4 (0.01%) 的相对误差
+                // 对于单精度浮点数矩阵乘法，累加误差是正常的
+                if (rel_err > 1e-4) {
+                    error_count++;
+                }
+                
+                if (error_count >= 10) break; // 发现10个错误就停止
             }
 
             // GFLOPs: 每秒执行的浮点运算次数
@@ -167,7 +189,8 @@ int main() {
             float v2_gflops = repeat_times * 2.0f * N * N * N / (v2_time_ms * 1e6f);
 
             // 写入 CSV
-            ofs << N << "," << cublas_gflops << "," << v2_gflops << "," << (error_count == 0 ? "1" : "0") << std::endl;
+            ofs << N << "," << cublas_gflops << "," << v2_gflops << "," << error_count << ",";
+            ofs << std::fixed << std::setprecision(2) << (100 * v2_gflops / cublas_gflops) << "%" << std::endl;
 
             // 释放资源
             cublasDestroy(handle);
