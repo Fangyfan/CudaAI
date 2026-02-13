@@ -21,7 +21,7 @@ void checkCublasError(cublasStatus_t status, const char* msg) {
     }
 }
 
-#define FLOAT4(p) (reinterpret_cast<float4*>(&(p)))
+#define FLOAT4(p) (*reinterpret_cast<float4*>(&(p)))
 #define OFFSET(y, x, ld) ((y) * (ld) + (x))
 
 // C[M, N] = A[M, K] × B[K, N]
@@ -39,28 +39,35 @@ __global__ void mysgemm_v4(int M, int N, int K, float alpha, float* A, float* B,
     // 则一维偏移量就是 by * BM * N + bx * BN
     C = &C[by * BM * N + bx * BN];
     
-    __shared__ float As[BM][BK]; // A tile size = (128, 8)
-    __shared__ float Bs[BK][BN]; // B tile size = (8, 128)
+    __shared__ float As[BM * BK]; // A tile size = (128, 8)
+    __shared__ float Bs[BK * BN]; // B tile size = (8, 128)
     
     int tid = threadIdx.y * blockDim.x + threadIdx.x; // 当前线程在 Block 内的一维偏移量
-    int a_tile_x = tid % BK; // 当前线程负责搬运 A tile 内的 x 坐标
-    int a_tile_y = tid / BK; // 当前线程负责搬运 A tile 内的 y 坐标
-    constexpr int a_tile_stride = BLOCK_DIM / BK; // Block 内所有线程每次能搬运多少行
-    int b_tile_x = tid % BN; // 当前线程负责搬运 B tile 内的 x 坐标
-    int b_tile_y = tid / BN; // 当前线程负责搬运 B tile 内的 y 坐标
-    constexpr int b_tile_stride = BLOCK_DIM / BN; // Block 内所有线程每次能搬运多少行
+    int a_tile_x = tid % (BK / 4) * 4; // 当前线程负责搬运 A tile 内的 x 坐标
+    int a_tile_y = tid / (BK / 4);     // 当前线程负责搬运 A tile 内的 y 坐标
+    int b_tile_x = tid % (BN / 4) * 4; // 当前线程负责搬运 B tile 内的 x 坐标
+    int b_tile_y = tid / (BN / 4);     // 当前线程负责搬运 B tile 内的 y 坐标
+
+    constexpr int a_load_num = BM * BK / (4 * BLOCK_DIM);
+    constexpr int b_load_num = BK * BN / (4 * BLOCK_DIM);
+    constexpr int a_tile_stride = BM / a_load_num; // Block 内所有线程每次能搬运 A 多少行
+    constexpr int b_tile_stride = BK / b_load_num; // Block 内所有线程每次能搬运 B 多少行
 
     float temp[TM][TN] = { 0.0f }; // 当前线程负责计算 C 中的小 tile 寄存器
+    float a_vec[TM]; // 当前线程读取的 As[ty...ty+TM-1][x] 寄存器
+    float b_vec[TN]; // 当前线程读取的 Bs[x][tx...tx+TN-1] 寄存器
 
     // 枚举每个 A/B tile
     for (int k = 0; k < K; k += BK) {
 #pragma unroll
-        for (int i = 0; i < BM; i += a_tile_stride) {
-            As[i + a_tile_y][a_tile_x] = A[(i + a_tile_y) * K + a_tile_x]; // 搬运 shared As
+        for (int i = 0; i < BM; i += a_tile_stride) { // 搬运 shared As
+            FLOAT4(As[OFFSET(i + a_tile_y, a_tile_x, BK)]) 
+            = FLOAT4(A[OFFSET(i + a_tile_y, a_tile_x, K)]);
         }
 #pragma unroll
-        for (int i = 0; i < BK; i += b_tile_stride) {
-            Bs[i + b_tile_y][b_tile_x] = B[(i + b_tile_y) * N + b_tile_x]; // 搬运 shared Bs
+        for (int i = 0; i < BK; i += b_tile_stride) { // 搬运 shared Bs
+            FLOAT4(Bs[OFFSET(i + b_tile_y, b_tile_x, BN)]) 
+            = FLOAT4(B[OFFSET(i + b_tile_y, b_tile_x, N)]);
         }
         __syncthreads(); // block 内同步，确保共享内存 As 和 Bs 搬运完成
         
@@ -69,12 +76,20 @@ __global__ void mysgemm_v4(int M, int N, int K, float alpha, float* A, float* B,
 
         // 遍历 Thread tile 内部 C 元素 temp[i][j]，计算部分点积
 #pragma unroll
-    for (int x = 0; x < BK; ++x) {
+        for (int x = 0; x < BK; ++x) {
 #pragma unroll
-        for (int i = 0; i < TM; ++i) {
+            for (int i = 0; i < TM; ++i) { // 把 As[ty ... ty+TM-1][x] 这一列的数取出来
+                a_vec[i] = As[OFFSET(ty + i, x, BK)];
+            }
 #pragma unroll
-            for (int j = 0; j < TN; ++j) {
-                    temp[i][j] += As[ty + i][x] * Bs[x][tx + j];
+            for (int j = 0; j < TN; j += 4) { // 把 Bs[x][tx ... tx+TN-1] 这一行的数取出来
+                FLOAT4(b_vec[j]) = FLOAT4(Bs[OFFSET(x, tx + j, BN)]);
+            }
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    temp[i][j] += a_vec[i] * b_vec[j]; // 部分点积: As[x][ty + i] * Bs[x][tx + j]
                 }
             }
         }
@@ -85,8 +100,14 @@ __global__ void mysgemm_v4(int M, int N, int K, float alpha, float* A, float* B,
 #pragma unroll
     for (int i = 0; i < TM; ++i) {
 #pragma unroll
-        for (int j = 0; j < TN; ++j) {
-            C[(ty + i) * N + (tx + j)] = alpha * temp[i][j] + beta * C[(ty + i) * N + (tx + j)];
+        for (int j = 0; j < TN; j += 4) {
+            float4 c4 = FLOAT4(C[OFFSET(ty + i, tx + j, N)]);
+            FLOAT4(C[OFFSET(ty + i, tx + j, N)]) = make_float4(
+                alpha * temp[i][j] + beta * c4.x, 
+                alpha * temp[i][j + 1] + beta * c4.y, 
+                alpha * temp[i][j + 2] + beta * c4.z, 
+                alpha * temp[i][j + 3] + beta * c4.w
+            );
         }
     }
 }

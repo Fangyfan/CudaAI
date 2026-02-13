@@ -42,9 +42,10 @@ __global__ void mysgemm_v3(int M, int N, int K, float alpha, float* A, float* B,
     int tid = threadIdx.y * blockDim.x + threadIdx.x; // 当前线程在 Block 内的一维偏移量
     int a_tile_x = tid % BK; // 当前线程负责搬运 A tile 内的 x 坐标
     int a_tile_y = tid / BK; // 当前线程负责搬运 A tile 内的 y 坐标
-    constexpr int a_tile_stride = BLOCK_DIM / BK; // Block 内所有线程每次能搬运多少行
     int b_tile_x = tid % BN; // 当前线程负责搬运 B tile 内的 x 坐标
     int b_tile_y = tid / BN; // 当前线程负责搬运 B tile 内的 y 坐标
+
+    constexpr int a_tile_stride = BLOCK_DIM / BK; // Block 内所有线程每次能搬运多少行
     constexpr int b_tile_stride = BLOCK_DIM / BN; // Block 内所有线程每次能搬运多少行
 
     float temp[TM][TN] = { 0.0f }; // 当前线程负责计算 C 中的小 tile 寄存器
@@ -66,11 +67,11 @@ __global__ void mysgemm_v3(int M, int N, int K, float alpha, float* A, float* B,
 
         // 遍历 Thread tile 内部 C 元素 temp[i][j]，计算部分点积
 #pragma unroll
-    for (int x = 0; x < BK; ++x) {
+        for (int x = 0; x < BK; ++x) {
 #pragma unroll
-        for (int i = 0; i < TM; ++i) {
+            for (int i = 0; i < TM; ++i) {
 #pragma unroll
-            for (int j = 0; j < TN; ++j) {
+                for (int j = 0; j < TN; ++j) {
                     temp[i][j] += As[ty + i][x] * Bs[x][tx + j];
                 }
             }
