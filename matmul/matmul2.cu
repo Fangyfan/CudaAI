@@ -54,11 +54,11 @@ __global__ void mysgemm_v3(int M, int N, int K, float alpha, float* A, float* B,
     for (int k = 0; k < K; k += BK) {
 #pragma unroll
         for (int i = 0; i < BM; i += a_tile_stride) {
-            As[i + a_tile_y][a_tile_x] = A[(i + a_tile_y) * K + a_tile_x]; // 搬运 shared As
+            As[a_tile_y + i][a_tile_x] = A[(a_tile_y + i) * K + a_tile_x]; // 搬运 shared As
         }
 #pragma unroll
         for (int i = 0; i < BK; i += b_tile_stride) {
-            Bs[i + b_tile_y][b_tile_x] = B[(i + b_tile_y) * N + b_tile_x]; // 搬运 shared Bs
+            Bs[b_tile_y + i][b_tile_x] = B[(b_tile_y + i) * N + b_tile_x]; // 搬运 shared Bs
         }
         __syncthreads(); // block 内同步，确保共享内存 As 和 Bs 搬运完成
         

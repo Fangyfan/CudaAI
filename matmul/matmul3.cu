@@ -61,13 +61,13 @@ __global__ void mysgemm_v4(int M, int N, int K, float alpha, float* A, float* B,
     for (int k = 0; k < K; k += BK) {
 #pragma unroll
         for (int i = 0; i < BM; i += a_tile_stride) { // 搬运 shared As
-            FLOAT4(As[OFFSET(i + a_tile_y, a_tile_x, BK)]) 
-            = FLOAT4(A[OFFSET(i + a_tile_y, a_tile_x, K)]);
+            FLOAT4(As[OFFSET(a_tile_y + i, a_tile_x, BK)]) 
+            = FLOAT4(A[OFFSET(a_tile_y + i, a_tile_x, K)]);
         }
 #pragma unroll
         for (int i = 0; i < BK; i += b_tile_stride) { // 搬运 shared Bs
-            FLOAT4(Bs[OFFSET(i + b_tile_y, b_tile_x, BN)]) 
-            = FLOAT4(B[OFFSET(i + b_tile_y, b_tile_x, N)]);
+            FLOAT4(Bs[OFFSET(b_tile_y + i, b_tile_x, BN)]) 
+            = FLOAT4(B[OFFSET(b_tile_y + i, b_tile_x, N)]);
         }
         __syncthreads(); // block 内同步，确保共享内存 As 和 Bs 搬运完成
         
@@ -89,7 +89,7 @@ __global__ void mysgemm_v4(int M, int N, int K, float alpha, float* A, float* B,
             for (int i = 0; i < TM; ++i) {
 #pragma unroll
                 for (int j = 0; j < TN; ++j) {
-                    temp[i][j] += a_vec[i] * b_vec[j]; // 部分点积: As[x][ty + i] * Bs[x][tx + j]
+                    temp[i][j] += a_vec[i] * b_vec[j]; // 部分点积: As[ty + i][x] * Bs[x][tx + j]
                 }
             }
         }
@@ -112,7 +112,16 @@ __global__ void mysgemm_v4(int M, int N, int K, float alpha, float* A, float* B,
     }
 }
 
+std::vector<int> generate() {
+    std::vector<int> sizes;
+    for (int i = 256; i <= 8192; i += 256) {
+        sizes.push_back(i);
+    }
+    return sizes;
+}
+
 int main() {
+    // std::vector<int> sizes = generate();
     std::vector<int> sizes = {128, 256, 512, 1024, 2048, 4096};
 
     // 打开 csv 文件
