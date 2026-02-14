@@ -24,20 +24,20 @@ void checkCublasError(cublasStatus_t status, const char* msg) {
 // C[M, N] = A[M, K] × B[K, N]
 template<int BM, int BN, int BK>
 __global__ void mysgemm_v2(int M, int N, int K, float alpha, float* A, float* B, float beta, float* C) {
-    int bx = blockIdx.x; // 当前 Block 在 x 方向的编号 [0, 31]
-    int by = blockIdx.y; // 当前 Block 在 y 方向的编号 [0, 31]
+    int bx = blockIdx.x * BN; // 当前 Block 在 x 方向的坐标
+    int by = blockIdx.y * BM; // 当前 Block 在 y 方向的坐标
     int tx = threadIdx.x; // 当前 Block 内该线程在 x 方向的编号 [0, 31]
     int ty = threadIdx.y; // 当前 Block 内该线程在 y 方向的编号 [0, 31]
 
     __shared__ float As[BM][BK]; // tile size = (32, 32)
     __shared__ float Bs[BK][BN]; // tile size = (32, 32)
 
-    A = &A[by * BM * K]; // A[M, K] 中 tile 的左上角 y 坐标为 by * BM，则一维偏移量就是 by * BM * K
-    B = &B[bx * BN]; 	 // B[K, N] 中 tile 的左上角 x 坐标为 bx * BN，则一维偏移量就是 bx * BN
-    
-    // C[M, N] 中 tile 的左上角 y 坐标为 by * BM，x 坐标为 bx * BN
-    // 则一维偏移量就是 by * BM * N + bx * BN
-    C = &C[by * BM * N + bx * BN];
+    // A[M, K] 中 tile 的左上角 y 坐标为 by，则一维偏移量就是 by * K
+    // B[K, N] 中 tile 的左上角 x 坐标为 bx，则一维偏移量就是 bx
+    // C[M, N] 中 tile 的左上角 y 坐标为 by，x 坐标为 bx，则一维偏移量就是 by * N + bx
+    A += by * K;
+    B += bx;
+    C += by * N + bx;
 
     // 枚举每个 tile，计算部分和，然后汇总
     float sum = 0.0f;

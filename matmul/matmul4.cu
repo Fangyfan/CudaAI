@@ -26,21 +26,21 @@ void checkCublasError(cublasStatus_t status, const char* msg) {
 
 // C[M, N] = A[M, K] × B[K, N]
 template<int BLOCK_DIM, int BM, int BN, int BK, int TM, int TN>
-__global__ void mysgemm_v5(int M, int N, int K, float alpha, float* A, float* B, float beta, float* C) {
-    int bx = blockIdx.x; // 当前 Block 在 x 方向的编号
-    int by = blockIdx.y; // 当前 Block 在 y 方向的编号
-    int tx = threadIdx.x * TN; // Thread Tile 左上角 x 坐标 [0, 16] * 8
-    int ty = threadIdx.y * TM; // Thread Tile 左上角 y 坐标 [0, 16] * 8
+__global__ void __launch_bounds__(BLOCK_DIM) mysgemm_v5(int M, int N, int K, float alpha, float* A, float* B, float beta, float* C) {
+    int bx = blockIdx.x * BN; // 当前 Block 在 x 方向的坐标
+    int by = blockIdx.y * BM; // 当前 Block 在 y 方向的坐标
+    int tx = threadIdx.x * TN; // Thread tile 左上角 x 坐标 [0, 16] * 8
+    int ty = threadIdx.y * TM; // Thread tile 左上角 y 坐标 [0, 16] * 8
     
-    A = &A[by * BM * K]; // A[M, K] 中 Tile 的左上角 y 坐标为 by * BM，则一维偏移量就是 by * BM * K
-    B = &B[bx * BN];     // B[K, N] 中 Tile 的左上角 x 坐标为 bx * BN，则一维偏移量就是 bx * BN
-
-    // C[M, N] 中 Tile 的左上角 y 坐标为 by * BM，x 坐标为 bx * BN
-    // 则一维偏移量就是 by * BM * N + bx * BN
-    C = &C[by * BM * N + bx * BN];
+    // A[M, K] 中 tile 的左上角 y 坐标为 by，则一维偏移量就是 by * K
+    // B[K, N] 中 tile 的左上角 x 坐标为 bx，则一维偏移量就是 bx
+    // C[M, N] 中 tile 的左上角 y 坐标为 by，x 坐标为 bx，则一维偏移量就是 by * N + bx
+    A += by * K;
+    B += bx;
+    C += by * N + bx;
     
     // 双缓冲流水线
-    __shared__ float As[2][BM * BK]; // A Tile Size = (128, 8)
+    __shared__ float As[2][BK * BM]; // A Tile Size = (8, 128)
     __shared__ float Bs[2][BK * BN]; // B Tile Size = (8, 128)
     
     int tid = threadIdx.y * blockDim.x + threadIdx.x; // 当前线程在 Block 内的一维偏移量
@@ -49,10 +49,8 @@ __global__ void mysgemm_v5(int M, int N, int K, float alpha, float* A, float* B,
     int b_tile_x = tid % (BN / 4) * 4; // 当前线程负责搬运 B Tile 内的 x 坐标
     int b_tile_y = tid / (BN / 4);     // 当前线程负责搬运 B Tile 内的 y 坐标
 
-    constexpr int a_load_num = BM * BK / (4 * BLOCK_DIM);
-    constexpr int b_load_num = BK * BN / (4 * BLOCK_DIM);
-    constexpr int a_tile_stride = BM / a_load_num; // Block 内所有线程每次能搬运 A 多少行
-    constexpr int b_tile_stride = BK / b_load_num; // Block 内所有线程每次能搬运 B 多少行
+    constexpr int a_tile_stride = (BLOCK_DIM * 4) / BK; // Block 内所有线程每次能搬运 A 多少行
+    constexpr int b_tile_stride = (BLOCK_DIM * 4) / BN; // Block 内所有线程每次能搬运 B 多少行
 
     float temp[TM][TN] = { 0.0f }; // 当前线程负责计算 C 中的小 Tile 寄存器
 
@@ -64,9 +62,12 @@ __global__ void mysgemm_v5(int M, int N, int K, float alpha, float* A, float* B,
 
     // 第一次加载: 从全局内存读取第 0 个 Tile 的数据，存入 As[0] 和 Bs[0]
 #pragma unroll
-    for (int i = 0; i < BM; i += a_tile_stride) {
-        FLOAT4(As[0][OFFSET(a_tile_y + i, a_tile_x, BK)])
-        = FLOAT4(A[OFFSET(a_tile_y + i, a_tile_x, K)]);
+    for (int i = 0, j = 0; i < BM; i += a_tile_stride, j += 4) {
+        FLOAT4(a_reg[j]) = FLOAT4(A[OFFSET(a_tile_y + i, a_tile_x, K)]);
+        As[0][OFFSET(a_tile_x, a_tile_y + i, BM)] = a_reg[j];
+        As[0][OFFSET(a_tile_x + 1, a_tile_y + i, BM)] = a_reg[j + 1];
+        As[0][OFFSET(a_tile_x + 2, a_tile_y + i, BM)] = a_reg[j + 2];
+        As[0][OFFSET(a_tile_x + 3, a_tile_y + i, BM)] = a_reg[j + 3];
     }
 #pragma unroll
     for (int i = 0; i < BK; i += b_tile_stride) {
@@ -78,8 +79,8 @@ __global__ void mysgemm_v5(int M, int N, int K, float alpha, float* A, float* B,
     // 预加载寄存器: 从 Shared Memory (As[0], Bs[0]) 中拿出第 0 个 Tile，放到寄存器中准备计算
     // 只存 x=0 所需的 TM × 1 和 1 × TN，即 As[0][ty...ty+TM-1][x] 和 Bs[0][x][tx...tx+TN-1]
 #pragma unroll
-    for (int i = 0; i < TM; ++i) {
-        a_vec[0][i] = As[0][OFFSET(ty + i, 0, BK)];
+    for (int i = 0; i < TM; i += 4) {
+        FLOAT4(a_vec[0][i]) = FLOAT4(As[0][OFFSET(0, ty + i, BM)]);
     }
 #pragma unroll
     for (int j = 0; j < TN; j += 4) {
@@ -115,8 +116,8 @@ __global__ void mysgemm_v5(int M, int N, int K, float alpha, float* A, float* B,
             // 此时正在准备计算第 x 行，但先把第 x+1 行的数据从 Shared Memory 读到寄存器 vec
             // 这里的 (x + 1) % 2 是为了在两个 vec 寄存器组之间轮转
 #pragma unroll
-            for (int i = 0; i < TM; ++i) { // 把 As[ty ... ty+TM-1][x+1] 这一列的数取出来
-                a_vec[(x + 1) & 1][i] = As[read_type][OFFSET(ty + i, x + 1, BK)];
+            for (int i = 0; i < TM; i += 4) { // 把 As[ty ... ty+TM-1][x+1] 这一列的数取出来
+                FLOAT4(a_vec[(x + 1) & 1][i]) = FLOAT4(As[read_type][OFFSET(x + 1, ty + i, BM)]);
             }
 #pragma unroll
             for (int j = 0; j < TN; j += 4) { // 把 Bs[x+1][tx ... tx+TN-1] 这一行的数取出来
@@ -137,7 +138,10 @@ __global__ void mysgemm_v5(int M, int N, int K, float alpha, float* A, float* B,
             // 把暂存在 a/b reg 里的数据，写入另一个空闲的 Shared Memory (write_type)
 #pragma unroll
             for (int i = 0, j = 0; i < BM; i += a_tile_stride, j += 4) {
-                FLOAT4(As[write_type][OFFSET(a_tile_y + i, a_tile_x, BK)]) = FLOAT4(a_reg[j]);
+                As[write_type][OFFSET(a_tile_x, a_tile_y + i, BM)] = a_reg[j];
+                As[write_type][OFFSET(a_tile_x + 1, a_tile_y + i, BM)] = a_reg[j + 1];
+                As[write_type][OFFSET(a_tile_x + 2, a_tile_y + i, BM)] = a_reg[j + 2];
+                As[write_type][OFFSET(a_tile_x + 3, a_tile_y + i, BM)] = a_reg[j + 3];
             }
 #pragma unroll
             for (int i = 0, j = 0; i < BK; i += b_tile_stride, j += 4) {
@@ -149,8 +153,8 @@ __global__ void mysgemm_v5(int M, int N, int K, float alpha, float* A, float* B,
 
             // 为了让下一轮循环 (k += BK) 的 x=0 能跑起来，这里必须手动预加载下一轮的第 0 行数据！
 #pragma unroll
-            for (int i = 0; i < TM; ++i) {
-                a_vec[0][i] = As[write_type][OFFSET(ty + i, 0, BK)];
+            for (int i = 0; i < TM; i += 4) {
+                FLOAT4(a_vec[0][i]) = FLOAT4(As[write_type][OFFSET(0, ty + i, BM)]);
             }
 #pragma unroll
             for (int j = 0; j < TN; j += 4) {
