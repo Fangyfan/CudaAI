@@ -1,0 +1,8 @@
+add_executable(race race.cu)
+add_executable(no_race no_race.cu)
+add_executable(histogram histogram.cu)
+add_executable(shistogram shistogram.cu)
+target_link_libraries(race PRIVATE ${CUDA_LIBRARIES})
+target_link_libraries(no_race PRIVATE ${CUDA_LIBRARIES})
+target_link_libraries(histogram PRIVATE ${CUDA_LIBRARIES})
+target_link_libraries(shistogram PRIVATE ${CUDA_LIBRARIES})
