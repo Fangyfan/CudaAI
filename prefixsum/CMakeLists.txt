@@ -1,0 +1,8 @@
+add_executable(kogge_stone1 kogge_stone1.cu)
+add_executable(kogge_stone2 kogge_stone2.cu)
+add_executable(work_efficient work_efficient.cu)
+add_executable(multi_block multi_block.cu)
+target_link_libraries(kogge_stone1 PRIVATE ${CUDA_LIBRARIES})
+target_link_libraries(kogge_stone2 PRIVATE ${CUDA_LIBRARIES})
+target_link_libraries(work_efficient PRIVATE ${CUDA_LIBRARIES})
+target_link_libraries(multi_block PRIVATE ${CUDA_LIBRARIES})
