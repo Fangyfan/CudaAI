@@ -4,6 +4,52 @@
 
 __global__ void kogge_stone_scan1(float* in, float* out, float* sum, int n) {
     extern __shared__ float T[];
+
+    int i = threadIdx.x;
+    int offset = blockIdx.x * blockDim.x;
+    T[i] = (offset + i < n) ? in[offset + i] : 0.0f;
+    __syncthreads();
+
+    float temp;
+    for (int stride = 1; stride < blockDim.x; stride <<= 1) {
+        if (i >= stride) {
+            temp = T[i - stride] + T[i];
+        }
+        __syncthreads();
+        if (i >= stride) {
+            T[i] = temp;
+        }
+        __syncthreads();
+    }
+
+    if (offset + i < n) out[offset + i] = T[i];
+    if (i == blockDim.x - 1) sum[blockIdx.x] = T[blockDim.x - 1];
+}
+
+__global__ void kogge_stone_scan2(float* in, float* out, int n) {
+    extern __shared__ float T[];
+
+    int i = threadIdx.x;
+    T[i] = i < n ? in[i] : 0.0f;
+    __syncthreads();
+
+    float sum;
+    for (int stride = 1; stride < n; stride <<= 1) {
+        if (i >= stride) {
+            sum = T[i - stride] + T[i];
+        }
+        __syncthreads();
+        if (i >= stride) {
+            T[i] = sum;
+        }
+        __syncthreads();
+    }
+
+    if (i < n) out[i] = T[i];
+}
+
+__global__ void kogge_stone_scan11(float* in, float* out, float* sum, int n) {
+    extern __shared__ float T[];
     float* source = T;
     float* destination = T + blockDim.x;
 
@@ -26,7 +72,7 @@ __global__ void kogge_stone_scan1(float* in, float* out, float* sum, int n) {
     if (i == blockDim.x - 1) sum[blockIdx.x] = source[blockDim.x - 1];
 }
 
-__global__ void kogge_stone_scan2(float* in, float* out, int n) {
+__global__ void kogge_stone_scan22(float* in, float* out, int n) {
     extern __shared__ float T[];
     float* source = T;
     float* destination = T + n;
@@ -132,7 +178,8 @@ __global__ void work_efficient_add_sums(float* out, float* sums) {
     out[offset + 2 * i + 1] += add_val;
 }
 
-void benchmark(std::vector<float>& h_in);
+void benchmark1(std::vector<float>& h_in);
+void benchmark2(std::vector<float>& h_in);
 int main() {
     constexpr int n = 1024 * 1024;
     constexpr int thread_num = 512;
@@ -148,7 +195,8 @@ int main() {
         h_ref[i] = h_in[i];
         if (i) h_ref[i] += h_ref[i - 1];
     }
-    benchmark(h_in);
+    benchmark1(h_in);
+    benchmark2(h_in);
     
     float* d_in;
     float* d_sum;
@@ -200,7 +248,7 @@ int main() {
     return 0;
 }
 
-void benchmark(std::vector<float>& h_in) {
+void benchmark1(std::vector<float>& h_in) {
     constexpr int n = 1024 * 1024;
     constexpr int thread_num = 1024;
     constexpr int block_num = n / thread_num;
@@ -226,15 +274,15 @@ void benchmark(std::vector<float>& h_in) {
     cudaEventCreate(&end);
 
     for (int i = 0; i < 10; ++i) {
-        kogge_stone_scan1<<<block_num, thread_num, 2 * thread_num * sizeof(float)>>>(d_in, d_out, d_sum, n);
-        kogge_stone_scan2<<<1, block_num, 2 * block_num * sizeof(float)>>>(d_sum, d_sum, block_num);
+        kogge_stone_scan1<<<block_num, thread_num, thread_num * sizeof(float)>>>(d_in, d_out, d_sum, n);
+        kogge_stone_scan2<<<1, block_num, block_num * sizeof(float)>>>(d_sum, d_sum, block_num);
         kogge_stone_add_sums<<<block_num, thread_num>>>(d_out, d_sum, n);
     }
 
     cudaEventRecord(start);
     for (int i = 0; i < 10; ++i) {
-        kogge_stone_scan1<<<block_num, thread_num, 2 * thread_num * sizeof(float)>>>(d_in, d_out, d_sum, n);
-        kogge_stone_scan2<<<1, block_num, 2 * block_num * sizeof(float)>>>(d_sum, d_sum, block_num);
+        kogge_stone_scan1<<<block_num, thread_num, thread_num * sizeof(float)>>>(d_in, d_out, d_sum, n);
+        kogge_stone_scan2<<<1, block_num, block_num * sizeof(float)>>>(d_sum, d_sum, block_num);
         kogge_stone_add_sums<<<block_num, thread_num>>>(d_out, d_sum, n);
     }
     cudaEventRecord(end);
@@ -253,7 +301,69 @@ void benchmark(std::vector<float>& h_in) {
             return;
         }
     }
-    std::cout << "Kogge stone prefix sum kernel execution time: " << milliseconds / 10 << " ms" << std::endl;
+    std::cout << "Kogge stone (in-place) prefix sum kernel execution time: " << milliseconds / 10 << " ms" << std::endl;
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(end);
+    cudaFree(d_in);
+    cudaFree(d_out);
+    cudaFree(d_sum);
+}
+
+void benchmark2(std::vector<float>& h_in) {
+    constexpr int n = 1024 * 1024;
+    constexpr int thread_num = 1024;
+    constexpr int block_num = n / thread_num;
+
+    std::vector<float> h_ref(n);
+    std::vector<float> h_out(n);
+
+    for (int i = 0; i < n; ++i) {
+        h_ref[i] = h_in[i];
+        if (i) h_ref[i] += h_ref[i - 1];
+    }
+
+    float* d_in;
+    float* d_sum;
+    float* d_out;
+    cudaMalloc(&d_in, n * sizeof(float));
+    cudaMalloc(&d_sum, block_num * sizeof(float));
+    cudaMalloc(&d_out, n * sizeof(float));
+    cudaMemcpy(d_in, h_in.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+
+    cudaEvent_t start, end;
+    cudaEventCreate(&start);
+    cudaEventCreate(&end);
+
+    for (int i = 0; i < 10; ++i) {
+        kogge_stone_scan11<<<block_num, thread_num, 2 * thread_num * sizeof(float)>>>(d_in, d_out, d_sum, n);
+        kogge_stone_scan22<<<1, block_num, 2 * block_num * sizeof(float)>>>(d_sum, d_sum, block_num);
+        kogge_stone_add_sums<<<block_num, thread_num>>>(d_out, d_sum, n);
+    }
+
+    cudaEventRecord(start);
+    for (int i = 0; i < 10; ++i) {
+        kogge_stone_scan11<<<block_num, thread_num, 2 * thread_num * sizeof(float)>>>(d_in, d_out, d_sum, n);
+        kogge_stone_scan22<<<1, block_num, 2 * block_num * sizeof(float)>>>(d_sum, d_sum, block_num);
+        kogge_stone_add_sums<<<block_num, thread_num>>>(d_out, d_sum, n);
+    }
+    cudaEventRecord(end);
+    cudaEventSynchronize(end);
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, end);
+
+    cudaMemcpy(h_out.data(), d_out, n * sizeof(float), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < n; ++i) {
+        float val = h_out[i];
+        float ref = h_ref[i];
+        float diff = fabsf(val - ref);
+        float rel_err = diff / (fabsf(ref) + 1e-7);
+        if (rel_err > 1e-4) {
+            std::cout << "Error at index " << i << ": Expected " << ref << ", Got " << val << std::endl;
+            return;
+        }
+    }
+    std::cout << "Kogge stone (double-buffer) prefix sum kernel execution time: " << milliseconds / 10 << " ms" << std::endl;
 
     cudaEventDestroy(start);
     cudaEventDestroy(end);
