@@ -78,6 +78,7 @@ __global__ void softmax_forward_kernel_2(float* out, const float* in, int N, int
     for (int stride = (blockDim.x >> 1); stride; stride >>= 1) {
         if (threadIdx.x < stride) {
             shared[threadIdx.x] += shared[threadIdx.x + stride];
+            // shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
         }
         __syncthreads();
     }
@@ -272,7 +273,7 @@ int main() {
 
     for (int i = 0; i < N; ++i) {
         for (int j = 0; j < C; ++j) {
-            in[i * C + j] = float(i * C + j);
+            in[i * C + j] = rand();
         }
     }
 
@@ -306,10 +307,10 @@ int main() {
     // constexpr int thread_num = 1;
     // softmax_forward_kernel_1<<<block_num, thread_num>>>(d_out, d_in, N, C);
 
-    // constexpr int block_num = N;
-    // constexpr int thread_num = 512;
-    // constexpr int shared_size = thread_num * sizeof(float);
-    // softmax_forward_kernel_2<<<block_num, thread_num, shared_size>>>(d_out, d_in, N, C);
+    constexpr int block_num = N;
+    constexpr int thread_num = 512;
+    constexpr int shared_size = thread_num * sizeof(float);
+    softmax_forward_kernel_2<<<block_num, thread_num, shared_size>>>(d_out, d_in, N, C);
 
     // constexpr int block_num = N;
     // constexpr int thread_num = 32;
@@ -320,9 +321,9 @@ int main() {
     // constexpr int shared_size = (thread_num / 32) * sizeof(float) * 2;
     // softmax_forward_kernel_4<<<block_num, thread_num, shared_size>>>(d_out, d_in, N, C);
 
-    constexpr int block_num = N;
-    constexpr int thread_num = 512;
-    softmax_forward_kernel_5<thread_num><<<block_num, thread_num>>>(d_out, d_in, N, C);
+    // constexpr int block_num = N;
+    // constexpr int thread_num = 512;
+    // softmax_forward_kernel_5<thread_num><<<block_num, thread_num>>>(d_out, d_in, N, C);
     cudaEventRecord(stop);
 
     // Wait for the event to complete

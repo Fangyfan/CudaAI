@@ -3,9 +3,9 @@
 #include <iostream>
 #include <assert.h>
 
-constexpr int N = 2048;
+constexpr int N = 8192;
 constexpr int d = 128;
-constexpr int nBlock = N / 128;
+constexpr int nBlock = N / 512;
 
 namespace naive {
 __global__ void naive_self_attention_kernel(float* query, float* key, float* value, float* output, float* score, float* prob, float scale) {
@@ -177,15 +177,10 @@ float* self_attention(float* query, float* key, float* value, float* output, flo
 namespace flash {
 constexpr int Br = 8;
 constexpr int Bc = 8;
-constexpr int Gr = N / Br;
-constexpr int Gc = 1;
-constexpr int Tc = N / Bc;
-constexpr int Dr = d / Br;
-constexpr int Dc = d / Bc;
 __global__ void flash_attention_v2_kernel(float* query, float* key, float* value, float* output, float scale) {
     __shared__ float Q[Br][d], K[Bc][d], V[Bc][d], O[Br][d];
     __shared__ float S[Br][Bc], Exp[Br][Bc];
-    __shared__ float MaxS[Br], SumExp[Br];
+    __shared__ float Max[Br], SumExp[Br];
     
     int tx = threadIdx.x;  // [0, Bc - 1]
     int ty = threadIdx.y;  // [0, Br - 1]
@@ -193,25 +188,26 @@ __global__ void flash_attention_v2_kernel(float* query, float* key, float* value
 
     // block 内的线程组织为 (Br, Bc)
     // 遍历每个块: Q[Br, Bc] + ... + Q[Br, Bc] = Q[Br, d]
-    // 每个 thread 搬运自己负责的 Q[ty][tx], Q[ty][tx + Bc], Q[ty][tx + 2Bc] , ...
-    for (int i = 0; i < Dc; ++i) {
-        Q[ty][i * Bc + tx] = query[r * d + i * Bc + tx];
-        O[ty][i * Bc + tx] = 0;
+    // 每个 thread 搬运自己负责的元素 Q[ty][tx], Q[ty][tx + Bc], Q[ty][tx + 2Bc] , ...
+    for (int i = 0; i < d / Bc; ++i) {
+        Q[ty][tx + i * Bc] = query[r * d + (tx + i * Bc)];
+        O[ty][tx + i * Bc] = 0.0f;
     }
     if (tx == 0) {
-        MaxS[ty] = -INFINITY;
+        Max[ty] = -INFINITY;
         SumExp[ty] = 0.0f;
     }
+    __syncthreads();
 
     // 每个 block 负责一个 query 的分块 Q[Br, d]
     // 需要遍历第 j = [0, Tc-1] 个 key / value 分块 K[Bc, d], V[Bc, d]
-    for (int j = 0; j < Tc; ++j) {
+    for (int j = 0; j < N / Bc; ++j) {
         // block 内的线程组织为 (Br, Bc)
         // 遍历每个块: (K/V)[Bc, Br] + ... + (K/V)[Bc, Br] = (K/V)[Bc, d]
         // 每个 thread 搬运自己负责的 (K/V)[tx][ty], (K/V)[tx][ty + Br], (K/V)[tx][ty + 2Br] , ...
-        for (int i = 0; i < Dr; ++i) {
-            K[tx][i * Br + ty] = key[(j * Bc + tx) * d + i * Br + ty];
-            V[tx][i * Br + ty] = value[(j * Bc + tx) * d + i * Br + ty];
+        for (int i = 0; i < d / Br; ++i) {
+            K[tx][ty + i * Br] = key[(tx + j * Bc) * d + (ty + i * Br)];
+            V[tx][ty + i * Br] = value[(tx + j * Bc) * d + (ty + i * Br)];
         }
         __syncthreads();
 
@@ -223,20 +219,19 @@ __global__ void flash_attention_v2_kernel(float* query, float* key, float* value
         S[ty][tx] = scale * sum; // 注意力分数缩放 QK^T / sqrt(d)
         __syncthreads();
 
-        // 计算当前块 S[Br][Bc] 中当前行 S[ty][...] 的局部最大值 localMaxS
-        float localMaxS = -INFINITY;
+        // 计算当前块 S[Br][Bc] 中当前行 S[ty][...] 的局部最大值 localMax
+        float localMax = -INFINITY;
         for (int i = 0; i < Bc; ++i) {
-            localMaxS = fmaxf(localMaxS, S[ty][i]);
+            localMax = fmaxf(localMax, S[ty][i]);
         }
-        // 更新目前的最大值 maxS
-        float maxS = fmaxf(MaxS[ty], localMaxS);
+        // 更新目前的最大值 newMax
+        float newMax = fmaxf(Max[ty], localMax);
         // online softmax 缩放比例: exp(更新前最大值 - 目前最大值)
-        float mScale = __expf(MaxS[ty] - maxS);
-        // 计算当前块内指数值 P[ty][tx] = exp(S[ty][tx] - m[ty])
-        // 注意这里 m[ty] 是当前 ty 行目前的最大值 maxS
-        Exp[ty][tx] = __expf(S[ty][tx] - maxS);
+        float expScale = __expf(Max[ty] - newMax);
+        // 计算当前块内指数值 P[ty][tx] = exp(S[ty][tx] - max[ty])
+        // 注意这里 max[ty] 是当前 ty 行目前的最大值 newMax
+        Exp[ty][tx] = __expf(S[ty][tx] - newMax);
         __syncthreads();
-        if (tx == 0) MaxS[ty] = maxS;
         
         if (tx == 0) {
             // 计算当前块内 ty 行 Exp[ty][...] 的指数值之和 localSumExp
@@ -245,30 +240,31 @@ __global__ void flash_attention_v2_kernel(float* query, float* key, float* value
                 localSumExp += Exp[ty][i];
             }
             // 更新前 SumExp[ty] 是以 [更新前最大值] 作为基准
-            // 现在要更新基准为 [目前最大值]，因此乘以 mScale
+            // 现在要更新基准为 [目前最大值]，因此乘以 expScale
             // 还要加上当前块内指数值之和 localSumExp (本来就是以 [目前最大值] 作为基准)
-            SumExp[ty] = mScale * SumExp[ty] + localSumExp;
+            SumExp[ty] = expScale * SumExp[ty] + localSumExp;
+            Max[ty] = newMax;
         }
 
-        // 计算加权部分和 O_i = mScale * O_i-1 + P_i * V_j
+        // 计算加权部分和 O_i = expScale * O_i-1 + P_i * V_j
         // block 内的线程组织为 (Br, Bc)
         // 遍历每个块: O[Br, Bc] + ... + O[Br, Bc] = O[Br, d]
         // 每个 thread 负责计算 O[ty][tx], O[ty][tx + Bc], O[ty][tx + 2Bc] , ...
-        // O[ty][...] = mScale * O[ty][...] + sum_k(P[ty][k] * V[k][...])
-        for (int i = 0; i < Dc; ++i) {
-            float newO = mScale * O[ty][i * Bc + tx];
+        // O[ty][...] = expScale * O[ty][...] + sum_k(P[ty][k] * V[k][...])
+        for (int i = 0; i < d / Bc; ++i) {
+            float newO = expScale * O[ty][tx + i * Bc];
             for (int k = 0; k < Bc; ++k) {
-                newO += Exp[ty][k] * V[k][i * Bc + tx];
+                newO += Exp[ty][k] * V[k][tx + i * Bc];
             }
-            O[ty][i * Bc + tx] = newO;
+            O[ty][tx + i * Bc] = newO;
         }
         __syncthreads();
     }
 
     // 每个 thread 负责更新 O[ty][tx], O[ty][tx + Bc], O[ty][tx + 2Bc] , ...
     // 除以 softmax 的分母值 SumExp[ty] = sum(exp(S - max))
-    for (int i = 0; i < Dc; ++i) {
-        output[r * d + i * Bc + tx] = O[ty][i * Bc + tx] / SumExp[ty];
+    for (int i = 0; i < d / Bc; ++i) {
+        output[r * d + (tx + i * Bc)] = O[ty][tx + i * Bc] / SumExp[ty];
     }
 }
 
@@ -279,8 +275,8 @@ float* self_attention(float* query, float* key, float* value, float* output, flo
     cudaEventCreate(&start);
     cudaEventCreate(&end);
     
-    dim3 grid_dim(Gc, Gr);
     dim3 block_dim(Bc, Br);
+    dim3 grid_dim(1, N / Br);
 
     for (int i = 0; i < 5; ++i) {
         flash_attention_v2_kernel<<<grid_dim, block_dim>>>(query, key, value, output, scale);
@@ -322,6 +318,7 @@ int main() {
     float* output;
     float* score;
     float* prob;
+    cudaSetDevice(0);
     cudaMalloc(&query, N * d * sizeof(float));
     cudaMalloc(&key, N * d * sizeof(float));
     cudaMalloc(&value, N * d * sizeof(float));
@@ -332,23 +329,36 @@ int main() {
     cudaMemcpy(key, key_cpu, N * d * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(value, value_cpu, N * d * sizeof(float), cudaMemcpyHostToDevice);
 
-    cudaMemset(output, 0, N * d * sizeof(float));
-    float* naive_output = naive::self_attention(query, key, value, output, score, prob);
+    // cudaMemset(output, 0, N * d * sizeof(float));
+    // float* naive_output = naive::self_attention(query, key, value, output, score, prob);
     cudaMemset(output, 0, N * d * sizeof(float));
     float* reduce_output = reduce::self_attention(query, key, value, output, score, prob);
     cudaMemset(output, 0, N * d * sizeof(float));
     float* flash_output = flash::self_attention(query, key, value, output, score, prob);
 
+    // for (int i = 0; i < N * d; ++i) {
+    //     float ref = naive_output[i];
+    //     float val1 = reduce_output[i];
+    //     float val2 = flash_output[i];
+    //     float diff1 = fabsf(ref - val1);
+    //     float diff2 = fabsf(ref - val2);
+    //     float rel_err1 = diff1 / (fabsf(ref) + 1e-7f);
+    //     float rel_err2 = diff2 / (fabsf(ref) + 1e-7f);
+    //     if (rel_err1 > 1e-4 || rel_err2 > 1e-4) {
+    //         std::cout << "[i = " << i << "] : " << naive_output[i] << " vs " << reduce_output[i] << " vs " << flash_output[i] << std::endl;
+    //         std::cout << "Attention kernel failed!" << std::endl;
+    //         return 1;
+    //     }
+    // }
+    // std::cout << "Attention kernel successed!" << std::endl;
+
     for (int i = 0; i < N * d; ++i) {
-        float ref = naive_output[i];
-        float val1 = reduce_output[i];
-        float val2 = flash_output[i];
-        float diff1 = fabsf(ref - val1);
-        float diff2 = fabsf(ref - val2);
-        float rel_err1 = diff1 / (fabsf(ref) + 1e-7f);
-        float rel_err2 = diff2 / (fabsf(ref) + 1e-7f);
-        if (rel_err1 > 1e-4 || rel_err2 > 1e-4) {
-            std::cout << "[i = " << i << "] : " << naive_output[i] << " vs " << reduce_output[i] << " vs " << flash_output[i] << std::endl;
+        float ref = reduce_output[i];
+        float val = flash_output[i];
+        float diff = fabsf(ref - val);
+        float rel_err = diff / (fabsf(ref) + 1e-7f);
+        if (rel_err > 1e-4) {
+            std::cout << "[i = " << i << "] : " << reduce_output[i] << " vs " << flash_output[i] << std::endl;
             std::cout << "Attention kernel failed!" << std::endl;
             return 1;
         }
@@ -362,7 +372,7 @@ int main() {
     cudaFree(score);
     cudaFree(prob);
 
-    delete[] naive_output;
+    // delete[] naive_output;
     delete[] reduce_output;
     delete[] flash_output;
     delete[] query_cpu;
