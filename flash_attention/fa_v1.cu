@@ -583,10 +583,10 @@ __device__ __forceinline__ MD shfl_xor_val(MD val, int delta) {
     return res;
 }
 
-__device__ __forceinline__ MD warp_reduce_md(MD val, MD_OP op) {
+__device__ __forceinline__ MD warp_reduce_md(MD val) {
 #pragma unroll
     for (int delta = 16; delta > 0; delta >>= 1) {
-        val = op(val, shfl_xor_val(val, delta));
+        val = MD_OP()(val, shfl_xor_val(val, delta));
     }
     return val;
 }
@@ -713,7 +713,9 @@ __device__ void gemm_PV_from_smem_by_wmma(half* s_V, T1* p_frag, T2* v_frag, T3*
 template <int Bc, int Wr, int Wc, int WM_ITERS, int WK_ITERS, typename T>
 __device__ void load_S_half_from_smem_to_frag(half* s_S, T* p_frag, int warp_row, int warp_col) {
     using namespace nvcuda;
+#pragma unroll
     for (int wm_idx = 0; wm_idx < WM_ITERS; ++wm_idx) {
+#pragma unroll
         for (int wk_idx = 0; wk_idx < WK_ITERS; ++wk_idx) {
             int offset = (warp_row * Wr + wm_idx * 16) * Bc + (wk_idx * 16);
             wmma::load_matrix_sync(p_frag[wm_idx * WK_ITERS + wk_idx], s_S + offset, Bc);
@@ -725,7 +727,9 @@ __device__ void load_S_half_from_smem_to_frag(half* s_S, T* p_frag, int warp_row
 template <int Bc, int Wr, int Wc, int WM_ITERS, int WN_ITERS, typename T>
 __device__ void store_gemm_S_to_smem(float* s_S, T* acc_frag, int warp_row, int warp_col) {
     using namespace nvcuda;
+#pragma unroll
     for (int wm_idx = 0; wm_idx < WM_ITERS; ++wm_idx) {
+#pragma unroll
         for (int wn_idx = 0; wn_idx < WN_ITERS; ++wn_idx) {
             int offset = (warp_row * Wr + wm_idx * 16) * Bc + (warp_col * Wc + wn_idx * 16);
             wmma::store_matrix_sync(s_S + offset, acc_frag[wm_idx * WN_ITERS + wn_idx], Bc, wmma::mem_row_major);
@@ -737,7 +741,9 @@ __device__ void store_gemm_S_to_smem(float* s_S, T* acc_frag, int warp_row, int 
 template <int Bd, int Wr, int Wc, int WM_ITERS, int WN_ITERS, typename T>
 __device__ void store_gemm_O_to_smem(float* s_O, T* acc_frag, int warp_row, int warp_col) {
     using namespace nvcuda;
+#pragma unroll
     for (int wm_idx = 0; wm_idx < WM_ITERS; ++wm_idx) {
+#pragma unroll
         for (int wn_idx = 0; wn_idx < WN_ITERS; ++wn_idx) {
             int offset = (warp_row * Wr + wm_idx * 16) * Bd + (warp_col * Wc + wn_idx * 16);
             wmma::store_matrix_sync(s_O + offset, acc_frag[wm_idx * WN_ITERS + wn_idx], Bd, wmma::mem_row_major);
@@ -753,10 +759,9 @@ Q / O: [batch, heads, N, d]
 K / V: [batch, heads, N, d]
 l / m: [batch, heads, N, 1]
 */
-template <int Br, int Bc, int Bd, int Wr, int Wc, int WM_ITERS, int WN_ITERS, int WK_ITERS>
-__global__ void flash_attention_kernel(float* Q, float* K, float* V, float* O, float* l, float* m, int N, int d, float scale) {
+template <int BLOCK_DIM, int Br, int Bc, int Bd, int Wr, int Wc, int WM_ITERS, int WN_ITERS, int WK_ITERS>
+__global__ void __launch_bounds__(BLOCK_DIM) flash_attention_kernel(float* Q, float* K, float* V, float* O, float* l, float* m, int N, int d, float scale) {
     using namespace nvcuda; // wmma
-    auto op = MD_OP();
 
     // 当前矩阵偏移量
     int qo_offset = (blockIdx.y * gridDim.x + blockIdx.x) * N * d;
@@ -830,15 +835,15 @@ __global__ void flash_attention_kernel(float* Q, float* K, float* V, float* O, f
                 // warp 内线程分工，对 s_S[Br, Bd] 进行 online softmax
                 for (int c = lane; c < Bc; c += 32) {
                     MD ml_val = { scale * s_S[r * Bc + c], 1.0f };
-                    row_ml_temp = op(row_ml_temp, ml_val);
+                    row_ml_temp = MD_OP()(row_ml_temp, ml_val);
                 }
                 __syncwarp();
 
                 // 得到 s_S[Br, Bc] 每一行的 m 和 l
-                row_ml_temp = warp_reduce_md(row_ml_temp, op);
+                row_ml_temp = warp_reduce_md(row_ml_temp);
                 if (lane == 0) {
                     row_ml[r] = row_ml_temp;
-                    row_ml_new[r] = op(row_ml_old[r], row_ml_temp);
+                    row_ml_new[r] = MD_OP()(row_ml_old[r], row_ml_temp);
                 }
 
                 // warp 内线程分工，更新 s_S_half[Br, Bc]
@@ -892,10 +897,10 @@ __global__ void flash_attention_kernel(float* Q, float* K, float* V, float* O, f
 void launch_flash_attention(float* Q, float* K, float* V, float* O, float* l, float* m, int batch, int heads, int N, int d, cudaStream_t stream) {
     float scale = rsqrtf(d);
     // 让 Bd = Bc 从而使得 S = QK^T 矩阵分片 [Br, Bc] 与 Q / O 矩阵分片 [Br, Bd] 形状相同，方便排布
-    constexpr int Br = 64;
-    constexpr int Bc = 32;
+    constexpr int Br = 32;
+    constexpr int Bc = 64;
     constexpr int Bd = Bc;
-    constexpr int Wr = 32;
+    constexpr int Wr = 16;
     constexpr int Wc = 16;
     constexpr int BLOCK_DIM = (Br / Wr) * (Bc / Wc) * 32;
     // 单个 warp 处理矩阵乘法 [M,K] × [K,N] = [M,N] 层面 M、N、K 方向每个 warp 的迭代次数
@@ -904,7 +909,7 @@ void launch_flash_attention(float* Q, float* K, float* V, float* O, float* l, fl
     constexpr int WK_ITERS = Bd / 16;
     dim3 gridDim(heads, batch);
     dim3 blockDim(BLOCK_DIM);
-    flash_attention_kernel<Br, Bc, Bd, Wr, Wc, WM_ITERS, WN_ITERS, WK_ITERS><<<gridDim, blockDim, 0, stream>>>(Q, K, V, O, l, m, N, d, scale);
+    flash_attention_kernel<BLOCK_DIM, Br, Bc, Bd, Wr, Wc, WM_ITERS, WN_ITERS, WK_ITERS><<<gridDim, blockDim, 0, stream>>>(Q, K, V, O, l, m, N, d, scale);
 }
 
 }  // namespace fa1_version3
@@ -917,13 +922,13 @@ struct KernelReport {
 };
 
 int main() {
-    constexpr int batch = 4;
-    constexpr int heads = 4;
-    constexpr int N = 512;
-    constexpr int d = 128;
+    constexpr int batch = 32;
+    constexpr int heads = 16;
+    constexpr int N = 1024;
+    constexpr int d = 64;
 
     constexpr int warmup__iters = 10;
-    constexpr int bench__iters  = 20;
+    constexpr int bench__iters  = 10;
 
     constexpr size_t qkv_elems = static_cast<size_t>(batch) * heads * N * d;
     constexpr size_t o_elems = qkv_elems;
@@ -951,6 +956,8 @@ int main() {
     float* d_P = nullptr;
     float* d_l = nullptr;
     float* d_m = nullptr;
+
+    CHECK_CUDA(cudaSetDevice(0));
 
     CHECK_CUDA(cudaMalloc(&d_Q, qkv_elems * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_K, qkv_elems * sizeof(float)));
