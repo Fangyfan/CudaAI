@@ -158,19 +158,19 @@ __device__ void load_QK_from_gmem_and_convert_to_half(float* Q, float* K, int d,
         row = i / Bd;
         col = i % Bd;
         temp4 = reinterpret_cast<float4*>(Q + offset_q + row * d + col)[0];
-        s_Q[row * Bd + col] = __float2half(temp4.x);
-        s_Q[row * Bd + col + 1] = __float2half(temp4.y);
-        s_Q[row * Bd + col + 2] = __float2half(temp4.z);
-        s_Q[row * Bd + col + 3] = __float2half(temp4.w);
+        s_Q[i] = __float2half(temp4.x);
+        s_Q[i + 1] = __float2half(temp4.y);
+        s_Q[i + 2] = __float2half(temp4.z);
+        s_Q[i + 3] = __float2half(temp4.w);
     }
     for (int i = (threadIdx.x << 2); i < Bc * Bd; i += (blockDim.x << 2)) {
         row = i / Bd;
         col = i % Bd;
         temp4 = reinterpret_cast<float4*>(K + offset_k + row * d + col)[0];
-        s_K[row * Bd + col] = __float2half(temp4.x);
-        s_K[row * Bd + col + 1] = __float2half(temp4.y);
-        s_K[row * Bd + col + 2] = __float2half(temp4.z);
-        s_K[row * Bd + col + 3] = __float2half(temp4.w);
+        s_K[i] = __float2half(temp4.x);
+        s_K[i + 1] = __float2half(temp4.y);
+        s_K[i + 2] = __float2half(temp4.z);
+        s_K[i + 3] = __float2half(temp4.w);
     }
 }
 
@@ -185,10 +185,10 @@ __device__ void load_V_from_gmem_and_convert_to_half(float* V, int d, half* s_V,
         row = i / Bd;
         col = i % Bd;
         temp4 = reinterpret_cast<float4*>(V + offset_v + row * d + col)[0];
-        s_V[row * Bd + col] = __float2half(temp4.x);
-        s_V[row * Bd + col + 1] = __float2half(temp4.y);
-        s_V[row * Bd + col + 2] = __float2half(temp4.z);
-        s_V[row * Bd + col + 3] = __float2half(temp4.w);
+        s_V[i] = __float2half(temp4.x);
+        s_V[i + 1] = __float2half(temp4.y);
+        s_V[i + 2] = __float2half(temp4.z);
+        s_V[i + 3] = __float2half(temp4.w);
     }
 }
 
@@ -202,7 +202,13 @@ __device__ void gemm_QK_from_smem_by_wmma(half* s_Q, half* s_K, T1* q_frag, T2* 
     for (int wm_idx = 0; wm_idx < WM_ITERS; ++wm_idx) {
 #pragma unroll
         for (int wk_idx = 0; wk_idx < WK_ITERS; ++wk_idx) {
+            // 计算当前 warp 迭代的 16x16 块在共享内存 s_Q 中的起始地址
+            // 行索引：warp_row * Wr 是当前 Warp 负责的起始行；wm_idx * 16 是当前 16x16 块的行偏移
+            // 列索引：wk_idx * 16 是当前 16x16 块的列偏移
+            // s_Q[Br, Bd] 的列数: Bd
             int offset = (warp_row * Wr + wm_idx * 16) * Bd + (wk_idx * 16);
+            // 从共享内存 s_Q + offset 以行优先的格式加载 16x16 的矩阵到 q_frag
+            // Bd 是矩阵 s_Q 的 leading dimension（行优先存储时的列数）
             wmma::load_matrix_sync(q_frag[wm_idx * WK_ITERS + wk_idx], s_Q + offset, Bd);
         }
     }
@@ -211,7 +217,13 @@ __device__ void gemm_QK_from_smem_by_wmma(half* s_Q, half* s_K, T1* q_frag, T2* 
     for (int wn_idx = 0; wn_idx < WN_ITERS; ++wn_idx) {
 #pragma unroll
         for (int wk_idx = 0; wk_idx < WK_ITERS; ++wk_idx) {
+            // 计算当前 warp 迭代的 16x16 块在共享内存 s_K 中的起始地址
+            // 行索引：warp_col * Wc 是当前 Warp 负责的起始行；wn_idx * 16 是当前 16x16 块的行偏移
+            // 列索引：wk_idx * 16 是当前 16x16 块的列偏移
+            // s_K[Bc, Bd] 的列数: Bd
             int offset = (warp_col * Wc + wn_idx * 16) * Bd + (wk_idx * 16);
+            // 从共享内存 s_K + offset 以行优先的格式加载 16x16 的矩阵到 k_frag
+            // Bd 是矩阵 s_K 的 leading dimension（行优先存储时的列数）
             wmma::load_matrix_sync(k_frag[wn_idx * WK_ITERS + wk_idx], s_K + offset, Bd);
         }
     }
@@ -243,7 +255,13 @@ __device__ void gemm_PV_from_smem_by_wmma(half* s_V, T1* p_frag, T2* v_frag, T3*
     for (int wn_idx = 0; wn_idx < WN_ITERS; ++wn_idx) {
 #pragma unroll
         for (int wk_idx = 0; wk_idx < WK_ITERS; ++wk_idx) {
+            // 计算当前 warp 迭代的 16x16 块在共享内存 s_V 中的起始地址
+            // 行索引：wk_idx * 16 是当前 16x16 块的行偏移
+            // 列索引：warp_col * Wc 是当前 Warp 负责的起始列；wn_idx * 16 是当前 16x16 块的列偏移
+            // s_V[Bc, Bd] 的列数: Bd
             int offset = (wk_idx * 16) * Bd + (warp_col * Wc + wn_idx * 16);
+            // 从共享内存 s_V + offset 以行优先的格式加载 16x16 的矩阵到 v_frag
+            // Bd 是矩阵 s_V 的 leading dimension（行优先存储时的列数）
             wmma::load_matrix_sync(v_frag[wn_idx * WK_ITERS + wk_idx], s_V + offset, Bd);
         }
     }
@@ -273,7 +291,13 @@ __device__ void load_S_half_from_smem_to_frag(half* s_S, T* p_frag, int warp_row
     for (int wm_idx = 0; wm_idx < WM_ITERS; ++wm_idx) {
 #pragma unroll
         for (int wk_idx = 0; wk_idx < WK_ITERS; ++wk_idx) {
+            // 计算当前 warp 迭代的 16x16 块在共享内存 s_S 中的起始地址
+            // 行索引：warp_row * Wr 是当前 Warp 负责的起始行；wm_idx * 16 是当前 16x16 块的行偏移
+            // 列索引：wk_idx * 16 是当前 16x16 块的列偏移
+            // s_S[Br, Bc] 的列数: Bc
             int offset = (warp_row * Wr + wm_idx * 16) * Bc + (wk_idx * 16);
+            // 从共享内存 s_S + offset 以行优先的格式加载 16x16 的矩阵到 p_frag
+            // Bc 是矩阵 s_S 的 leading dimension（行优先存储时的列数）
             wmma::load_matrix_sync(p_frag[wm_idx * WK_ITERS + wk_idx], s_S + offset, Bc);
         }
     }
@@ -287,7 +311,13 @@ __device__ void store_gemm_S_to_smem(float* s_S, T* acc_frag, int warp_row, int 
     for (int wm_idx = 0; wm_idx < WM_ITERS; ++wm_idx) {
 #pragma unroll
         for (int wn_idx = 0; wn_idx < WN_ITERS; ++wn_idx) {
+            // 计算当前 warp 迭代的 16x16 块在共享内存 s_S 中的起始地址
+            // 行索引：warp_row * Wr 是当前 Warp 负责的起始行；wm_idx * 16 是当前 16x16 块的行偏移
+            // 列索引：warp_col * Wc 是当前 Warp 负责的起始列；wn_idx * 16 是当前 16x16 块的列偏移
+            // s_S[Br, Bc] 的列数: Bc
             int offset = (warp_row * Wr + wm_idx * 16) * Bc + (warp_col * Wc + wn_idx * 16);
+            // 将 acc_frag 中对应的 16x16 浮点结果块，以行优先（wmma::mem_row_major）的格式写入共享内存 s_S + offset
+            // Bc 是矩阵 s_S 的 leading dimension（行优先存储时的列数）
             wmma::store_matrix_sync(s_S + offset, acc_frag[wm_idx * WN_ITERS + wn_idx], Bc, wmma::mem_row_major);
         }
     }
@@ -301,7 +331,13 @@ __device__ void store_gemm_O_to_smem(float* s_O, T* acc_frag, int warp_row, int 
     for (int wm_idx = 0; wm_idx < WM_ITERS; ++wm_idx) {
 #pragma unroll
         for (int wn_idx = 0; wn_idx < WN_ITERS; ++wn_idx) {
+            // 计算当前 warp 迭代的 16x16 块在共享内存 s_O 中的起始地址
+            // 行索引：warp_row * Wr 是当前 Warp 负责的起始行；wm_idx * 16 是当前 16x16 块的行偏移
+            // 列索引：warp_col * Wc 是当前 Warp 负责的起始列；wn_idx * 16 是当前 16x16 块的列偏移
+            // s_O[Br, Bd] 的列数: Bd
             int offset = (warp_row * Wr + wm_idx * 16) * Bd + (warp_col * Wc + wn_idx * 16);
+            // 将 acc_frag 中对应的 16x16 浮点结果块，以行优先（wmma::mem_row_major）的格式写入共享内存 s_O + offset
+            // Bd 是矩阵 s_O 的 leading dimension（行优先存储时的列数）
             wmma::store_matrix_sync(s_O + offset, acc_frag[wm_idx * WN_ITERS + wn_idx], Bd, wmma::mem_row_major);
         }
     }
@@ -342,16 +378,16 @@ __global__ void __launch_bounds__(BLOCK_DIM) flash_attention_v1_kernel(float* Q,
     int warp_row = warp / (Bc / Wc);
     int warp_num = blockDim.x >> 5;
 
-    using FragAType = wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major>;
-    using FragBType = wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major>;
-    using FragCFloatType = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
-    using FragVType = wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major>;
+    using FragAType = wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major>; // Q or softmax(QK^T/sqrt(d))
+    using FragBType = wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major>; // K^T
+    using FragCFloatType = wmma::fragment<wmma::accumulator, 16, 16, 16, float>; // QK^T or softmax(QK^T/sqrt(d))V
+    using FragVType = wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major>; // V
 
     // 当前 warp 内的矩阵乘法片段
-    FragAType a_frag[WM_ITERS * WK_ITERS];        // 用于存储左乘矩阵 Q[Br, Bd] 和 QK^T[Br, Bc] 的分片
-    FragBType b_frag[WN_ITERS * WK_ITERS];        // 用于存储右乘矩阵 K[Bc, Bd] 的分片
-    FragCFloatType acc_frag[WM_ITERS * WN_ITERS]; // 用于存储结果矩阵 QK^T[Br, Bc], PV[Br, Bd] 的分片
-    FragVType v_frag[WN_ITERS * WK_ITERS];        // 用于存储右乘矩阵 V[Bc, Bd] 的分片
+    FragAType a_frag[WM_ITERS * WK_ITERS];        // 存储左乘矩阵 Q[Br, Bd] 和 QK^T[Br, Bc] 中属于当前 warp 的分片
+    FragBType b_frag[WN_ITERS * WK_ITERS];        // 存储右乘矩阵 K[Bc, Bd] 中属于当前 warp 的分片
+    FragCFloatType acc_frag[WM_ITERS * WN_ITERS]; // 存储结果矩阵 QK^T[Br, Bc], PV[Br, Bd] 中属于当前 warp 的分片
+    FragVType v_frag[WN_ITERS * WK_ITERS];        // 存储右乘矩阵 V[Bc, Bd] 中属于当前 warp 的分片
 
     // 对 KV 在 N 维度分组，每组长度为 Bc，共分为 Tc = N / Bc 组
     for (int j = 0; j < N; j += Bc) {
@@ -456,17 +492,18 @@ void launch_flash_attention_v1(float* Q, float* K, float* V, float* O, float* l,
     constexpr int Br = 32;
     constexpr int Bc = 64;
     constexpr int Bd = Bc;
-    constexpr int Wr = 16;
-    constexpr int Wc = 16;
+    constexpr int Wr = 16;  // 每个 warp 负责的输出子块的行数（是 16 的倍数）
+    constexpr int Wc = 16;  // 每个 warp 负责的输出子块的列数（是 16 的倍数）
     constexpr int BLOCK_DIM = (Br / Wr) * (Bc / Wc) * 32;
     // 单个 warp 处理矩阵乘法 [M,K] × [K,N] = [M,N] 层面 M、N、K 方向每个 warp 的迭代次数
-    constexpr int WM_ITERS = Wr / 16;
-    constexpr int WN_ITERS = Wc / 16;
-    constexpr int WK_ITERS = Bd / 16;
+    constexpr int WM_ITERS = Wr / 16;  // 输出行方向的迭代，每个 warp 负责 Wr 行输出，每次处理 16 行
+    constexpr int WN_ITERS = Wc / 16;  // 输出列方向的迭代，每个 warp 负责 Wc 列输出，每次处理 16 列
+    constexpr int WK_ITERS = Bd / 16;  // 收缩维度（d 维度）的迭代，每次处理 16 个元素
     dim3 gridDim(heads, batch);
     dim3 blockDim(BLOCK_DIM);
     flash_attention_v1_kernel<BLOCK_DIM, Br, Bc, Bd, Wr, Wc, WM_ITERS, WN_ITERS, WK_ITERS><<<gridDim, blockDim, 0, stream>>>(Q, K, V, O, l, m, N, d, scale);
 }
+
 }  // namespace fa1_version3
 
 
@@ -1775,13 +1812,13 @@ void launch_flash_attention_v2(half* Q, half* K, half* V, half* O, int batch, in
 
 namespace benchmark {
 
-constexpr int batch = 4;
-constexpr int heads = 4;
-constexpr int N = 512;
+constexpr int batch = 32;
+constexpr int heads = 8;
+constexpr int N = 1024;
 constexpr int d = 128;
 
 constexpr int warmup__iters = 10;
-constexpr int bench__iters  = 20;
+constexpr int bench__iters  = 50;
 
 constexpr float kAtolFloat = 1e-2f;
 constexpr float kRtolFloat = 1e-2f;
@@ -2033,6 +2070,8 @@ int main() {
     float *d_O = nullptr, *d_S = nullptr, *d_P = nullptr;
     float *d_l = nullptr, *d_m = nullptr;
     half *d_Qh = nullptr, *d_Kh = nullptr, *d_Vh = nullptr, *d_Oh = nullptr;
+
+    CHECK_CUDA(cudaSetDevice(1));
 
     CHECK_CUDA(cudaMalloc(&d_Q, qkv_float_bytes));
     CHECK_CUDA(cudaMalloc(&d_K, qkv_float_bytes));
