@@ -84,7 +84,7 @@ void topk_priority_queue(int* input, int* output, int n, int k) {
 }
 } // namespace Topk_Priority_Queue
 
-namespace Topk_One_Block_Reduce {
+namespace Topk_Block_Reduce {
 template <int TOPK>
 __device__ __forceinline__ void update_topk(int* topk, int val) {
     if (topk[TOPK - 1] >= val) {
@@ -108,7 +108,7 @@ __global__ void topk_kernel(int* input, int* output, int n) {
     int local_topk[TOPK];
 
     for (int i = 0; i < TOPK; ++i) {
-        local_topk[i] = INT32_MIN;
+        local_topk[i] = INT_MIN;
     }
 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -147,12 +147,150 @@ __global__ void topk_kernel(int* input, int* output, int n) {
 
 template <int TOPK>
 void launch_topk(int* input, int* temp, int* output, int n, cudaStream_t stream) {
-    constexpr int block_num = 64;
-    constexpr int thread_num = 512;
+    constexpr int block_num = 128;
+    constexpr int thread_num = 32;
     topk_kernel<TOPK, thread_num><<<block_num, thread_num, 0, stream>>>(input, temp, n);
     topk_kernel<TOPK, block_num><<<1, block_num, 0, stream>>>(temp, output, block_num * TOPK);
 }
-} // namespace Topk_One_Block_Reduce
+} // namespace Topk_Block_Reduce
+
+namespace Topk_Block_Reduce_Optimized {
+template <int TOPK>
+__device__ __forceinline__ void init_topk(int* topk) {
+#pragma unroll
+    for (int i = 0; i < TOPK; ++i) {
+        topk[i] = INT_MIN;
+    }
+}
+
+// topk 按降序排列：topk[0] >= topk[1] >= ... >= topk[TOPK-1]
+template <int TOPK>
+__device__ __forceinline__ void update_topk(int* topk, int val) {
+    if (val <= topk[TOPK - 1]) {
+        return;
+    }
+
+#pragma unroll
+    for (int i = TOPK - 2; i >= 0; i--) {
+        if (val > topk[i]) {
+            topk[i + 1] = topk[i];
+        } else {
+            topk[i + 1] = val;
+            return;
+        }
+    }
+    topk[0] = val;
+}
+
+template <int TOPK>
+__device__ __forceinline__ void merge_topk(int* dst, const int* src) {
+#pragma unroll
+    for (int i = 0; i < TOPK; ++i) {
+        update_topk<TOPK>(dst, src[i]);
+    }
+}
+
+// warp 内规约：每个 lane 都维护自己的 topk，经过 butterfly 之后，
+// warp 内所有 lane 都会得到相同的 warp topk。
+// 这样做的好处是：
+// 1. 不需要在线程级别把所有 topk 都写进 shared memory
+// 2. 不需要 block 级树规约那么多 __syncthreads()
+template <int TOPK, int WARP_SIZE = 32>
+__device__ __forceinline__ void warp_reduce_topk(int* local_topk) {
+    int peer_topk[TOPK];
+
+#pragma unroll
+    for (int delta = (WARP_SIZE >> 1); delta > 0; delta >>= 1) {
+#pragma unroll
+        for (int i = 0; i < TOPK; ++i) {
+            peer_topk[i] = __shfl_xor_sync(0xffffffff, local_topk[i], delta, WARP_SIZE);
+        }
+        merge_topk<TOPK>(local_topk, peer_topk);
+    }
+}
+
+template <int TOPK, int BLOCK_DIM>
+__global__ void topk_kernel(const int* __restrict__ input, int* __restrict__ output, int n) {
+    static_assert(BLOCK_DIM % 32 == 0, "BLOCK_DIM must be multiple of 32");
+
+    constexpr int WARPS_PER_BLOCK = BLOCK_DIM / 32;
+
+     // 每个 warp 只存一份 warp topk
+    __shared__ int shared_warp_topk[WARPS_PER_BLOCK][TOPK];
+
+    int local_topk[TOPK];
+    init_topk<TOPK>(local_topk);
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int global_thread_id = blockIdx.x * blockDim.x + tid;
+    const int total_threads = gridDim.x * blockDim.x;
+
+    // 全局内存读取：int4 向量化
+    const int n4 = n >> 2;
+    const int4* input4 = reinterpret_cast<const int4*>(input);
+    for (int i = global_thread_id; i < n4; i += total_threads) {
+        int4 v = input4[i];
+        update_topk<TOPK>(local_topk, v.x);
+        update_topk<TOPK>(local_topk, v.y);
+        update_topk<TOPK>(local_topk, v.z);
+        update_topk<TOPK>(local_topk, v.w);
+    }
+    for (int i = (n4 << 2) + global_thread_id; i < n; i += total_threads) {
+        update_topk<TOPK>(local_topk, input[i]);
+    }
+
+    // warp 内归约 -> warp topk
+    warp_reduce_topk<TOPK, 32>(local_topk);
+
+    // 每个 warp 只让 lane0 写出一份 warp topk
+    if (lane == 0) {
+#pragma unroll
+        for (int i = 0; i < TOPK; ++i) {
+            shared_warp_topk[warp][i] = local_topk[i];
+        }
+    }
+    __syncthreads();
+
+    // warp0 归并所有 warp topk -> block topk
+    if (warp == 0) {
+        int block_topk[TOPK];
+        init_topk<TOPK>(block_topk);
+
+        // 只有前 WARPS_PER_BLOCK 个 lane 负责加载 warp 结果
+        if (lane < WARPS_PER_BLOCK) {
+#pragma unroll
+            for (int i = 0; i < TOPK; ++i) {
+                block_topk[i] = shared_warp_topk[lane][i];
+            }
+        }
+
+        // 其他 lane 用 -INF 填充，不影响最终结果
+        if (lane >= WARPS_PER_BLOCK) {
+            init_topk<TOPK>(block_topk);
+        }
+
+        // warp0 内再做一次 topk 归约
+        warp_reduce_topk<TOPK, WARPS_PER_BLOCK>(block_topk);
+
+        if (lane == 0) {
+#pragma unroll
+            for (int i = 0; i < TOPK; ++i) {
+                output[blockIdx.x * TOPK + i] = block_topk[i];
+            }
+        }
+    }
+}
+
+template <int TOPK>
+void launch_topk(int* input, int* temp, int* output, int n, cudaStream_t stream) {
+    constexpr int block_num = 128;
+    constexpr int thread_num = 32;
+    topk_kernel<TOPK, thread_num><<<block_num, thread_num, 0, stream>>>(input, temp, n);
+    topk_kernel<TOPK, block_num><<<1, block_num, 0, stream>>>(temp, output, block_num * TOPK);
+}
+} // namespace Topk_Block_Reduce_Optimized
 
 namespace bench_utils {
 
@@ -246,7 +384,7 @@ inline void print_report_table(const std::vector<Report>& reports, double baseli
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "==================== TopK Benchmark ====================\n";
     std::cout << std::left
-              << std::setw(28) << "name"
+              << std::setw(34) << "name"
               << std::setw(14) << "avg_ms"
               << std::setw(18) << "speedup_vs_base"
               << std::setw(10) << "correct"
@@ -255,7 +393,7 @@ inline void print_report_table(const std::vector<Report>& reports, double baseli
     for (const auto& r : reports) {
         const double speedup = (r.avg_ms > 0.0) ? (baseline_ms / r.avg_ms) : 0.0;
         std::cout << std::left
-                  << std::setw(28) << r.name
+                  << std::setw(34) << r.name
                   << std::setw(14) << r.avg_ms
                   << std::setw(18) << speedup
                   << std::setw(10) << (r.pass ? "PASS" : "FAIL");
@@ -276,7 +414,7 @@ int main() {
     constexpr int TOPK = 20;
     constexpr int warmup__iters = 10;
     constexpr int bench__iters = 20;
-    constexpr int gpu_stage1_blocks = 512;
+    constexpr int gpu_stage1_blocks = 64;
 
     std::vector<int> h_input(N);
 
@@ -292,15 +430,20 @@ int main() {
     std::vector<int> h_out_quick(TOPK);
     std::vector<int> h_out_pq(TOPK);
     std::vector<int> h_out_gpu(TOPK);
+    std::vector<int> h_out_gpu_opt(TOPK);
     std::vector<int> h_temp_quick(N);
 
     int* d_input = nullptr;
     int* d_temp = nullptr;
     int* d_output = nullptr;
+    int* d_temp_opt = nullptr;
+    int* d_output_opt = nullptr;
 
     CHECK_CUDA(cudaMalloc(&d_input, static_cast<size_t>(N) * sizeof(int)));
     CHECK_CUDA(cudaMalloc(&d_temp, static_cast<size_t>(gpu_stage1_blocks) * TOPK * sizeof(int)));
     CHECK_CUDA(cudaMalloc(&d_output, static_cast<size_t>(TOPK) * sizeof(int)));
+    CHECK_CUDA(cudaMalloc(&d_temp_opt, static_cast<size_t>(gpu_stage1_blocks) * TOPK * sizeof(int)));
+    CHECK_CUDA(cudaMalloc(&d_output_opt, static_cast<size_t>(TOPK) * sizeof(int)));
 
     cudaStream_t stream;
     CHECK_CUDA(cudaStreamCreate(&stream));
@@ -322,7 +465,7 @@ int main() {
         bench__iters);
 
     auto baseline_cmp = bench_utils::compare_topk_exact(h_ref.data(), h_out_baseline.data(), TOPK);
-    reports.push_back({"baseline_cpu",
+    reports.push_back({"baseline_cpu_partial_sort_copy",
                        baseline_ms,
                        baseline_cmp.pass,
                        baseline_cmp.first_bad_idx,
@@ -366,7 +509,7 @@ int main() {
             // launch_topk 每次都会完整覆盖 d_temp 和 d_output
         },
         [&]() {
-            Topk_One_Block_Reduce::launch_topk<TOPK>(d_input, d_temp, d_output, N, stream);
+            Topk_Block_Reduce::launch_topk<TOPK>(d_input, d_temp, d_output, N, stream);
         },
         warmup__iters,
         bench__iters,
@@ -379,12 +522,37 @@ int main() {
     CHECK_CUDA(cudaStreamSynchronize(stream));
 
     auto gpu_cmp = bench_utils::compare_topk_exact(h_ref.data(), h_out_gpu.data(), TOPK);
-    reports.push_back({"Topk_One_Block_Reduce",
+    reports.push_back({"Topk_Block_Reduce",
                        static_cast<double>(gpu_ms),
                        gpu_cmp.pass,
                        gpu_cmp.first_bad_idx,
                        gpu_cmp.ref_val,
                        gpu_cmp.test_val});
+
+    const float gpu_opt_ms = bench_utils::benchmark_gpu_ms(
+        [&]() {
+            // launch_topk 每次都会完整覆盖 d_temp_opt 和 d_output_opt
+        },
+        [&]() {
+            Topk_Block_Reduce_Optimized::launch_topk<TOPK>(d_input, d_temp_opt, d_output_opt, N, stream);
+        },
+        warmup__iters,
+        bench__iters,
+        stream);
+
+    CHECK_CUDA(cudaMemcpy(h_out_gpu_opt.data(),
+                          d_output_opt,
+                          static_cast<size_t>(TOPK) * sizeof(int),
+                          cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+
+    auto gpu_opt_cmp = bench_utils::compare_topk_exact(h_ref.data(), h_out_gpu_opt.data(), TOPK);
+    reports.push_back({"Topk_Block_Reduce_Optimized",
+                       static_cast<double>(gpu_opt_ms),
+                       gpu_opt_cmp.pass,
+                       gpu_opt_cmp.first_bad_idx,
+                       gpu_opt_cmp.ref_val,
+                       gpu_opt_cmp.test_val});
 
     std::cout << "N = " << N << ", TOPK = " << TOPK
               << ", warmup = " << warmup__iters
@@ -395,6 +563,8 @@ int main() {
     CHECK_CUDA(cudaFree(d_input));
     CHECK_CUDA(cudaFree(d_temp));
     CHECK_CUDA(cudaFree(d_output));
+    CHECK_CUDA(cudaFree(d_temp_opt));
+    CHECK_CUDA(cudaFree(d_output_opt));
     CHECK_CUDA(cudaStreamDestroy(stream));
     return 0;
 }
