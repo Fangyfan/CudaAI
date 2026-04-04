@@ -817,8 +817,10 @@ int main() {
     constexpr int M = 4096;
     constexpr int N = 4096;
     constexpr int K = 4096;
-    constexpr int warmup_iters = 5;
-    constexpr int bench_iters = 10;
+    constexpr int warmup_iters = 10;
+    constexpr int bench_iters = 50;
+
+    CHECK_CUDA(cudaSetDevice(3));
 
     const size_t size_A = static_cast<size_t>(M) * K;
     const size_t size_B = static_cast<size_t>(K) * N;
@@ -906,24 +908,24 @@ int main() {
               << ", TFLOPS=" << baseline_tflops << "\n\n";
 
     std::cout << std::left
-              << std::setw(24) << "Kernel"
-              << std::setw(14) << "avg_ms"
-              << std::setw(14) << "TFLOPS"
-              << std::setw(14) << "vs_cublas"
-              << std::setw(10) << "Result"
-              << std::setw(14) << "max_abs"
-              << std::setw(14) << "max_rel"
+              << std::setw(22) << "Kernel"
+              << std::setw(12) << "avg_ms"
+              << std::setw(12) << "TFLOPS"
+              << std::setw(12) << "vs_cublas"
+              << std::setw(8) << "Result"
+              << std::setw(12) << "max_abs"
+              << std::setw(12) << "max_rel"
               << "\n";
 
     for (const auto& r : results) {
         std::cout << std::left
-                  << std::setw(24) << r.name
-                  << std::setw(14) << r.avg_ms
-                  << std::setw(14) << r.tflops
-                  << std::setw(14) << (r.avg_ms / baseline_ms)
-                  << std::setw(10) << (r.err.pass ? "PASS" : "FAIL")
-                  << std::setw(14) << r.err.max_abs
-                  << std::setw(14) << r.err.max_rel
+                  << std::setw(22) << r.name
+                  << std::setw(12) << r.avg_ms
+                  << std::setw(12) << r.tflops
+                  << std::setw(12) << (baseline_ms / r.avg_ms)
+                  << std::setw(8) << (r.err.pass ? "PASS" : "FAIL")
+                  << std::setw(12) << r.err.max_abs
+                  << std::setw(12) << r.err.max_rel
                   << "\n";
     }
 
