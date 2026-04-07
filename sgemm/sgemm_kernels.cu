@@ -719,3 +719,166 @@ void launch_sgemm_kernel(const float* A, const float* B, float* C, int M, int N,
     sgemm_kernel<BM, BN, BK, WM, WN><<<gridDim, blockDim, 0, stream>>>(A, B, C, M, N, K);
 }
 }
+
+namespace Tensor_Core_WMMA_TF32 {
+#define BLOCK_DIM 512
+#define WARPS_Y 4
+#define WARPS_X 4
+#define WM_ITERS 1
+#define WN_ITERS 2
+#define WK_ITERS 2
+#define TC_M 16
+#define TC_N 16
+#define TC_K 8
+#define BM 64   // (WARPS_Y * WM_ITERS * TC_M)
+#define BN 128  // (WARPS_X * WN_ITERS * TC_N)
+#define BK 16   // (WK_ITERS * TC_K)
+#define WM 16   // (WM_ITERS * TC_M)
+#define WN 32   // (WN_ITERS * TC_N)
+#define PAD 8
+#define FLOAT2(addr) *(reinterpret_cast<float2*>(addr))
+#define FLOAT4(addr) *(reinterpret_cast<float4*>(addr))
+
+#define CP_ASYNC_CA_SHARED_GLOBAL_FLOAT2(saddr, gaddr) asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" :: "r"((unsigned)__cvta_generic_to_shared(saddr)), "l"(gaddr))
+#define CP_ASYNC_CA_SHARED_GLOBAL_FLOAT4(saddr, gaddr) asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" :: "r"((unsigned)__cvta_generic_to_shared(saddr)), "l"(gaddr))
+#define CP_ASYNC_COMMIT_GROUP asm volatile("cp.async.commit_group;\n" ::)
+#define CP_ASYNC_WAIT_GROUP_0 asm volatile("cp.async.wait_group 0;\n" ::)
+#define CP_ASYNC_WAIT_GROUP_1 asm volatile("cp.async.wait_group 1;\n" ::)
+
+__device__ void load_from_gmem_to_smem_A(float* s_A, const float* A, int K, int k) {
+    constexpr int load_nfloats_per_thread = BM * BK / BLOCK_DIM;
+    constexpr int nfloat2_per_row = BK / load_nfloats_per_thread;
+    int trow = threadIdx.x / nfloat2_per_row;
+    int tcol = threadIdx.x % nfloat2_per_row;
+    int grow = (blockIdx.y * BM) + trow;
+    int gcol = k + (tcol * load_nfloats_per_thread);
+    CP_ASYNC_CA_SHARED_GLOBAL_FLOAT2(s_A + load_nfloats_per_thread * threadIdx.x,
+                                     A + grow * K + gcol);
+}
+
+__device__ void load_from_gmem_to_smem_B(float* s_B, const float* B, int N, int k) {
+    constexpr int load_nfloats_per_thread = BK * BN / BLOCK_DIM;
+    constexpr int nfloat4_per_row = BN / load_nfloats_per_thread;
+    int trow = threadIdx.x / nfloat4_per_row;
+    int tcol = threadIdx.x % nfloat4_per_row;
+    int grow = k + trow;
+    int gcol = (blockIdx.x * BN) + (tcol * load_nfloats_per_thread);
+    CP_ASYNC_CA_SHARED_GLOBAL_FLOAT4(s_B + trow * (BN + PAD) + tcol * load_nfloats_per_thread,
+                                     B + grow * N + gcol);
+}
+
+__global__ void sgemm_kernel(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
+    int M, int N, int K) {
+    using namespace nvcuda;
+
+    const int warp_id = threadIdx.x >> 5;
+    const int warp_row = warp_id / WARPS_X;
+    const int warp_col = warp_id % WARPS_X;
+
+    __shared__ float s_A[2][BM * BK];
+    __shared__ float s_B[2][BK * (BN + PAD)];
+
+    using FragAType = wmma::fragment<wmma::matrix_a, TC_M, TC_N, TC_K, wmma::precision::tf32, wmma::row_major>;
+    using FragBType = wmma::fragment<wmma::matrix_b, TC_M, TC_N, TC_K, wmma::precision::tf32, wmma::row_major>;
+    using FragCType = wmma::fragment<wmma::accumulator, TC_M, TC_N, TC_K, float>;
+
+    FragAType a_frag[WM_ITERS][WK_ITERS];
+    FragBType b_frag[WK_ITERS][WN_ITERS];
+    FragCType c_frag[WM_ITERS][WN_ITERS];
+
+    for (int i = 0; i < WM_ITERS; ++i) {
+        for (int j = 0; j < WN_ITERS; ++j) {
+            wmma::fill_fragment(c_frag[i][j], 0.0f);
+        }
+    }
+
+    int buffer_id = 0;
+    load_from_gmem_to_smem_A(s_A[buffer_id], A, K, 0);
+    load_from_gmem_to_smem_B(s_B[buffer_id], B, N, 0);
+    CP_ASYNC_COMMIT_GROUP;
+
+    for (int k = 0; k < K; k += BK) {
+        if (k + BK < K) {
+            load_from_gmem_to_smem_A(s_A[buffer_id ^ 1], A, K, k + BK);
+            load_from_gmem_to_smem_B(s_B[buffer_id ^ 1], B, N, k + BK);
+            CP_ASYNC_COMMIT_GROUP;
+            CP_ASYNC_WAIT_GROUP_1;
+        } else {
+            CP_ASYNC_WAIT_GROUP_0;
+        }
+        __syncthreads();
+
+        for (int wm_idx = 0; wm_idx < WM_ITERS; ++wm_idx) {
+            for (int wk_idx = 0; wk_idx < WK_ITERS; ++wk_idx) {
+                int offset = (warp_row * WM + wm_idx * TC_M) * BK + (wk_idx * TC_K);
+                wmma::load_matrix_sync(a_frag[wm_idx][wk_idx], s_A[buffer_id] + offset, BK);
+            }
+        }
+
+        for (int wk_idx = 0; wk_idx < WK_ITERS; ++wk_idx) {
+            for (int wn_idx = 0; wn_idx < WN_ITERS; ++wn_idx) {
+                int offset = (wk_idx * TC_K) * (BN + PAD) + (warp_col * WN + wn_idx * TC_N);
+                wmma::load_matrix_sync(b_frag[wk_idx][wn_idx], s_B[buffer_id] + offset, BN + PAD);
+            }
+        }
+
+        for (int wm_idx = 0; wm_idx < WM_ITERS; ++wm_idx) {
+            for (int wn_idx = 0; wn_idx < WN_ITERS; ++wn_idx) {
+                for (int wk_idx = 0; wk_idx < WK_ITERS; ++wk_idx) {
+                    wmma::mma_sync(c_frag[wm_idx][wn_idx],
+                                   a_frag[wm_idx][wk_idx],
+                                   b_frag[wk_idx][wn_idx],
+                                   c_frag[wm_idx][wn_idx]);
+                }
+            }
+        }
+
+        buffer_id ^= 1;
+        __syncthreads();
+    }
+
+    for (int wm_idx = 0; wm_idx < WM_ITERS; ++wm_idx) {
+        for (int wn_idx = 0; wn_idx < WN_ITERS; ++wn_idx) {
+            int row = (blockIdx.y * BM) + (warp_row * WM) + (wm_idx * TC_M);
+            int col = (blockIdx.x * BN) + (warp_col * WN) + (wn_idx * TC_N);
+            wmma::store_matrix_sync(C + row * N + col,
+                                    c_frag[wm_idx][wn_idx],
+                                    N,
+                                    wmma::mem_row_major);
+        }
+    }
+}
+
+void launch_sgemm_kernel(const float* A, const float* B, float* C,
+                         int M, int N, int K, cudaStream_t stream) {
+    dim3 blockDim(BLOCK_DIM);
+    dim3 gridDim(N / BN, M / BM);
+    sgemm_kernel<<<gridDim, blockDim, 0, stream>>>(A, B, C, M, N, K);
+}
+
+#undef BLOCK_DIM
+#undef WARPS_Y
+#undef WARPS_X
+#undef WM_ITERS
+#undef WN_ITERS
+#undef WK_ITERS
+#undef TC_M
+#undef TC_N
+#undef TC_K
+#undef BM
+#undef BN
+#undef BK
+#undef WM
+#undef WN
+#undef PAD
+#undef FLOAT2
+#undef FLOAT4
+#undef CP_ASYNC_CA_SHARED_GLOBAL_FLOAT2
+#undef CP_ASYNC_CA_SHARED_GLOBAL_FLOAT4
+#undef CP_ASYNC_COMMIT_GROUP
+#undef CP_ASYNC_WAIT_GROUP_0
+#undef CP_ASYNC_WAIT_GROUP_1
+}  // namespace Tensor_Core_WMMA_TF32
