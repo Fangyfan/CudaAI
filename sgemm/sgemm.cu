@@ -711,7 +711,7 @@ void launch_sgemm_kernel(const float* A, const float* B, float* C, int M, int N,
     constexpr int BM = 128;
     constexpr int BN = 128;
     constexpr int BK = 16;
-    constexpr int WM = 64;
+    constexpr int WM = 32;
     constexpr int WN = 32;
     dim3 blockDim((BN / WN) * (BM / WM) * 32);
     dim3 gridDim(N / BN, M / BM);
@@ -724,16 +724,16 @@ namespace Tensor_Core_WMMA_TF32 {
 #define BLOCK_DIM 512
 #define WARPS_Y 4
 #define WARPS_X 4
-#define WM_ITERS 1
+#define WM_ITERS 2
 #define WN_ITERS 2
 #define WK_ITERS 2
 #define TC_M 16
 #define TC_N 16
 #define TC_K 8
-#define BM 64   // (WARPS_Y * WM_ITERS * TC_M)
+#define BM 128  // (WARPS_Y * WM_ITERS * TC_M)
 #define BN 128  // (WARPS_X * WN_ITERS * TC_N)
 #define BK 16   // (WK_ITERS * TC_K)
-#define WM 16   // (WM_ITERS * TC_M)
+#define WM 32   // (WM_ITERS * TC_M)
 #define WN 32   // (WN_ITERS * TC_N)
 #define PAD 8
 #define FLOAT2(addr) *(reinterpret_cast<float2*>(addr))
@@ -745,18 +745,18 @@ namespace Tensor_Core_WMMA_TF32 {
 #define CP_ASYNC_WAIT_GROUP_0 asm volatile("cp.async.wait_group 0;\n" ::)
 #define CP_ASYNC_WAIT_GROUP_1 asm volatile("cp.async.wait_group 1;\n" ::)
 
-__device__ void load_from_gmem_to_smem_A(float* s_A, const float* A, int K, int k) {
+__device__ __forceinline__ void load_from_gmem_to_smem_A(float* s_A, const float* A, int K, int k) {
     constexpr int load_nfloats_per_thread = BM * BK / BLOCK_DIM;
     constexpr int nfloat2_per_row = BK / load_nfloats_per_thread;
     int trow = threadIdx.x / nfloat2_per_row;
     int tcol = threadIdx.x % nfloat2_per_row;
     int grow = (blockIdx.y * BM) + trow;
     int gcol = k + (tcol * load_nfloats_per_thread);
-    CP_ASYNC_CA_SHARED_GLOBAL_FLOAT2(s_A + load_nfloats_per_thread * threadIdx.x,
+    CP_ASYNC_CA_SHARED_GLOBAL_FLOAT4(s_A + load_nfloats_per_thread * threadIdx.x,
                                      A + grow * K + gcol);
 }
 
-__device__ void load_from_gmem_to_smem_B(float* s_B, const float* B, int N, int k) {
+__device__ __forceinline__ void load_from_gmem_to_smem_B(float* s_B, const float* B, int N, int k) {
     constexpr int load_nfloats_per_thread = BK * BN / BLOCK_DIM;
     constexpr int nfloat4_per_row = BN / load_nfloats_per_thread;
     int trow = threadIdx.x / nfloat4_per_row;
@@ -786,7 +786,7 @@ __global__ void sgemm_kernel(
     using FragCType = wmma::fragment<wmma::accumulator, TC_M, TC_N, TC_K, float>;
 
     FragAType a_frag[WM_ITERS][WK_ITERS];
-    FragBType b_frag[WK_ITERS][WN_ITERS];
+    FragBType b_frag[WN_ITERS][WK_ITERS];
     FragCType c_frag[WM_ITERS][WN_ITERS];
 
     for (int i = 0; i < WM_ITERS; ++i) {
@@ -799,17 +799,15 @@ __global__ void sgemm_kernel(
     load_from_gmem_to_smem_A(s_A[buffer_id], A, K, 0);
     load_from_gmem_to_smem_B(s_B[buffer_id], B, N, 0);
     CP_ASYNC_COMMIT_GROUP;
+    CP_ASYNC_WAIT_GROUP_0;
+    __syncthreads();
 
     for (int k = 0; k < K; k += BK) {
         if (k + BK < K) {
             load_from_gmem_to_smem_A(s_A[buffer_id ^ 1], A, K, k + BK);
             load_from_gmem_to_smem_B(s_B[buffer_id ^ 1], B, N, k + BK);
             CP_ASYNC_COMMIT_GROUP;
-            CP_ASYNC_WAIT_GROUP_1;
-        } else {
-            CP_ASYNC_WAIT_GROUP_0;
         }
-        __syncthreads();
 
         for (int wm_idx = 0; wm_idx < WM_ITERS; ++wm_idx) {
             for (int wk_idx = 0; wk_idx < WK_ITERS; ++wk_idx) {
@@ -818,10 +816,10 @@ __global__ void sgemm_kernel(
             }
         }
 
-        for (int wk_idx = 0; wk_idx < WK_ITERS; ++wk_idx) {
-            for (int wn_idx = 0; wn_idx < WN_ITERS; ++wn_idx) {
+        for (int wn_idx = 0; wn_idx < WN_ITERS; ++wn_idx) {
+            for (int wk_idx = 0; wk_idx < WK_ITERS; ++wk_idx) {
                 int offset = (wk_idx * TC_K) * (BN + PAD) + (warp_col * WN + wn_idx * TC_N);
-                wmma::load_matrix_sync(b_frag[wk_idx][wn_idx], s_B[buffer_id] + offset, BN + PAD);
+                wmma::load_matrix_sync(b_frag[wn_idx][wk_idx], s_B[buffer_id] + offset, BN + PAD);
             }
         }
 
@@ -830,13 +828,14 @@ __global__ void sgemm_kernel(
                 for (int wk_idx = 0; wk_idx < WK_ITERS; ++wk_idx) {
                     wmma::mma_sync(c_frag[wm_idx][wn_idx],
                                    a_frag[wm_idx][wk_idx],
-                                   b_frag[wk_idx][wn_idx],
+                                   b_frag[wn_idx][wk_idx],
                                    c_frag[wm_idx][wn_idx]);
                 }
             }
         }
 
         buffer_id ^= 1;
+        CP_ASYNC_WAIT_GROUP_0;
         __syncthreads();
     }
 
@@ -981,8 +980,8 @@ int main() {
     constexpr int M = 4096;
     constexpr int N = 4096;
     constexpr int K = 4096;
-    constexpr int warmup_iters = 10;
-    constexpr int bench_iters = 20;
+    constexpr int warmup_iters = 20;
+    constexpr int bench_iters = 50;
 
     const size_t size_A = static_cast<size_t>(M) * K;
     const size_t size_B = static_cast<size_t>(K) * N;
@@ -1077,23 +1076,23 @@ int main() {
 
     std::cout << std::left
               << std::setw(24) << "Kernel"
-              << std::setw(14) << "avg_ms"
-              << std::setw(14) << "TFLOPS"
-              << std::setw(14) << "vs_cublas"
+              << std::setw(12) << "avg_ms"
+              << std::setw(12) << "TFLOPS"
+              << std::setw(12) << "vs_cublas"
               << std::setw(10) << "Result"
-              << std::setw(14) << "max_abs"
-              << std::setw(14) << "max_rel"
+              << std::setw(12) << "max_abs"
+              << std::setw(12) << "max_rel"
               << "\n";
 
     for (const auto& r : results) {
         std::cout << std::left
                   << std::setw(24) << r.name
-                  << std::setw(14) << r.avg_ms
-                  << std::setw(14) << r.tflops
-                  << std::setw(14) << (baseline_ms / r.avg_ms)
+                  << std::setw(12) << r.avg_ms
+                  << std::setw(12) << r.tflops
+                  << std::setw(12) << (baseline_ms / r.avg_ms)
                   << std::setw(10) << (r.err.pass ? "PASS" : "FAIL")
-                  << std::setw(14) << r.err.max_abs
-                  << std::setw(14) << r.err.max_rel
+                  << std::setw(12) << r.err.max_abs
+                  << std::setw(12) << r.err.max_rel
                   << "\n";
     }
 

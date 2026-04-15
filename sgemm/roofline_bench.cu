@@ -1,5 +1,6 @@
 // roofline_bench.cu
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <mma.h>
 
 #include <algorithm>
@@ -38,6 +39,7 @@ double run_timed(cudaEvent_t t0, cudaEvent_t t1, F launch, int reps) {
 
 // forward declaration
 double measure_tc_tf32_tflops(int smCount, int maxThreadsPerSm);
+double measure_tc_fp16_tflops(int smCount, int maxThreadsPerSm);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // gmem bandwidth benchmark
@@ -384,6 +386,112 @@ double measure_tc_tf32_tflops(int smCount, int maxThreadsPerSm) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Tensor Core FP16 throughput benchmark
+// Volta and later (sm_70+), using WMMA 16x16x16 FP16 tiles
+// ─────────────────────────────────────────────────────────────────────────────
+static const int TC_FP16_M = 16;
+static const int TC_FP16_N = 16;
+static const int TC_FP16_K = 16;
+
+static const long long TC_FP16_FLOPS_PER_MMA =
+    2LL * TC_FP16_M * TC_FP16_N * TC_FP16_K; // 8192 FLOPs
+
+template <int N_MMA>
+__global__ static void fp16_mma_kernel(float* __restrict__ sink, int inner_reps) {
+    wmma::fragment<wmma::matrix_a, TC_FP16_M, TC_FP16_N, TC_FP16_K,
+                   __half, wmma::row_major> a;
+    wmma::fragment<wmma::matrix_b, TC_FP16_M, TC_FP16_N, TC_FP16_K,
+                   __half, wmma::col_major> b;
+    wmma::fragment<wmma::accumulator, TC_FP16_M, TC_FP16_N, TC_FP16_K, float> c[N_MMA];
+
+    wmma::fill_fragment(a, __float2half(1.0f));
+    wmma::fill_fragment(b, __float2half(1.0f));
+
+    #pragma unroll
+    for (int n = 0; n < N_MMA; ++n) {
+        wmma::fill_fragment(c[n], 0.0f);
+    }
+
+    for (int r = 0; r < inner_reps; ++r) {
+        #pragma unroll
+        for (int n = 0; n < N_MMA; ++n) {
+            wmma::mma_sync(c[n], a, b, c[n]);
+        }
+    }
+
+    float total = 0.f;
+    #pragma unroll
+    for (int n = 0; n < N_MMA; ++n) {
+        for (int i = 0; i < c[n].num_elements; ++i) {
+            total += c[n].x[i];
+        }
+    }
+
+    if (total == -1.f) sink[blockIdx.x] = total;
+}
+
+template <int N_MMA>
+static double tc_fp16_one(int smCount,
+                          int maxThreadsPerSm,
+                          cudaEvent_t t0,
+                          cudaEvent_t t1) {
+    const int warps_per_block   = TC_THREADS / 32;
+    const int max_blocks_per_sm = maxThreadsPerSm / TC_THREADS;
+
+    double best = 0.0;
+
+    for (int bps = 1; bps <= max_blocks_per_sm; ++bps) {
+        const int blocks = smCount * bps;
+
+        float* d_sink = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_sink, static_cast<size_t>(blocks) * sizeof(float)));
+
+        fp16_mma_kernel<N_MMA><<<blocks, TC_THREADS>>>(d_sink, TC_INNER);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        CUDA_CHECK(cudaEventRecord(t0));
+        for (int r = 0; r < TC_OUTER; ++r) {
+            fp16_mma_kernel<N_MMA><<<blocks, TC_THREADS>>>(d_sink, TC_INNER);
+        }
+        CUDA_CHECK(cudaEventRecord(t1));
+        CUDA_CHECK(cudaEventSynchronize(t1));
+
+        float ms = 0.f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
+
+        double flops =
+            static_cast<double>(blocks) *
+            warps_per_block *
+            N_MMA *
+            TC_INNER *
+            TC_FP16_FLOPS_PER_MMA *
+            TC_OUTER;
+
+        best = std::max(best, flops / 1e12 / (ms / 1e3));
+
+        CUDA_CHECK(cudaFree(d_sink));
+    }
+
+    return best;
+}
+
+double measure_tc_fp16_tflops(int smCount, int maxThreadsPerSm) {
+    cudaEvent_t t0, t1;
+    CUDA_CHECK(cudaEventCreate(&t0));
+    CUDA_CHECK(cudaEventCreate(&t1));
+
+    double best = 0.0;
+    best = std::max(best, tc_fp16_one<1>(smCount, maxThreadsPerSm, t0, t1));
+    best = std::max(best, tc_fp16_one<2>(smCount, maxThreadsPerSm, t0, t1));
+    best = std::max(best, tc_fp16_one<4>(smCount, maxThreadsPerSm, t0, t1));
+    best = std::max(best, tc_fp16_one<8>(smCount, maxThreadsPerSm, t0, t1));
+
+    CUDA_CHECK(cudaEventDestroy(t0));
+    CUDA_CHECK(cudaEventDestroy(t1));
+    return best;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // public API
 // ─────────────────────────────────────────────────────────────────────────────
 void print_device_info(int dev) {
@@ -455,6 +563,17 @@ void print_device_info(int dev) {
     } else {
         printf("\n── Tensor Core TF32 (measured) ─────────────────────────\n");
         printf("  skipped: TF32 WMMA requires Ampere or newer GPU\n");
+    }
+    
+    if (p.major >= 7) {
+        printf("\n── Tensor Core FP16 (measured) ─────────────────────────\n");
+        printf("  FP16 (ILP+sweep) ... "); fflush(stdout);
+        printf("%.1f TFLOPS\n",
+               measure_tc_fp16_tflops(p.multiProcessorCount,
+                                      p.maxThreadsPerMultiProcessor));
+    } else {
+        printf("\n── Tensor Core FP16 (measured) ─────────────────────────\n");
+        printf("  skipped: FP16 WMMA requires Volta or newer GPU\n");
     }
 
     printf("══════════════════════════════════════════════════════\n\n");
