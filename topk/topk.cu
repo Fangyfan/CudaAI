@@ -255,29 +255,21 @@ __global__ void topk_kernel(const int* __restrict__ input, int* __restrict__ out
 
     // warp0 归并所有 warp topk -> block topk
     if (warp == 0) {
-        int block_topk[TOPK];
-        init_topk<TOPK>(block_topk);
-
         // 只有前 WARPS_PER_BLOCK 个 lane 负责加载 warp 结果
         if (lane < WARPS_PER_BLOCK) {
 #pragma unroll
             for (int i = 0; i < TOPK; ++i) {
-                block_topk[i] = shared_warp_topk[lane][i];
+                local_topk[i] = shared_warp_topk[lane][i];
             }
         }
 
-        // 其他 lane 用 -INF 填充，不影响最终结果
-        if (lane >= WARPS_PER_BLOCK) {
-            init_topk<TOPK>(block_topk);
-        }
-
         // warp0 内再做一次 topk 归约
-        warp_reduce_topk<TOPK, WARPS_PER_BLOCK>(block_topk);
+        warp_reduce_topk<TOPK, WARPS_PER_BLOCK>(local_topk);
 
         if (lane == 0) {
 #pragma unroll
             for (int i = 0; i < TOPK; ++i) {
-                output[blockIdx.x * TOPK + i] = block_topk[i];
+                output[blockIdx.x * TOPK + i] = local_topk[i];
             }
         }
     }
