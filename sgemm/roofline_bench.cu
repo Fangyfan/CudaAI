@@ -37,9 +37,40 @@ double run_timed(cudaEvent_t t0, cudaEvent_t t1, F launch, int reps) {
     return static_cast<double>(ms);
 }
 
+static int cuda_cores_per_sm(int major, int minor) {
+    const int v = major * 10 + minor;
+    switch (v) {
+        case 89: return 128; // Ada Lovelace, e.g. RTX 4090
+        case 86: return 128; // Ampere GA10x
+        case 80: return 64;  // A100
+        case 75: return 64;  // Turing
+        case 70: return 64;  // Volta
+        default: return 0;   // unknown arch
+    }
+}
+
+static double estimate_cuda_core_fp32_peak_tflops(const cudaDeviceProp& p) {
+    int cores_per_sm = cuda_cores_per_sm(p.major, p.minor);
+    if (cores_per_sm == 0) return 0.0;
+
+    double sm_clock_ghz = static_cast<double>(p.clockRate) * 1e-6; // kHz -> GHz
+    double total_cores  = static_cast<double>(cores_per_sm) * p.multiProcessorCount;
+    return total_cores * 2.0 * sm_clock_ghz / 1e3; // TFLOPS
+}
+
+static double estimate_smem_peak_GBs(const cudaDeviceProp& p) {
+    // shared memory has 32 banks, each bank 32 bits (4 bytes) per clock
+    double sm_clock_hz = static_cast<double>(p.clockRate) * 1e3; // kHz -> Hz
+    double bytes_per_sm_per_cycle = 32.0 * 4.0;                  // 128 B/cycle/SM
+    return bytes_per_sm_per_cycle *
+           p.multiProcessorCount *
+           sm_clock_hz / 1e9;                                    // GB/s
+}
+
 // forward declaration
 double measure_tc_tf32_tflops(int smCount, int maxThreadsPerSm);
 double measure_tc_fp16_tflops(int smCount, int maxThreadsPerSm);
+double measure_cuda_core_fp32_tflops(int smCount, int maxThreadsPerSm);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // gmem bandwidth benchmark
@@ -492,6 +523,108 @@ double measure_tc_fp16_tflops(int smCount, int maxThreadsPerSm) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CUDA Core FP32 throughput benchmark
+// measure sustained FP32 FMA throughput on regular CUDA cores
+// ─────────────────────────────────────────────────────────────────────────────
+static const int CC_THREADS = 256;   // 8 warps/block
+static const int CC_INNER   = 4096;  // FMA loop count per launch
+static const int CC_OUTER   = 20;
+
+// one FFMA = 2 FLOPs
+template <int N_ACC>
+__global__ static void cuda_core_fp32_kernel(float* __restrict__ sink, int inner_reps) {
+    // float a = 1.0000001f + 0.0001f * (threadIdx.x & 7);
+    // float b = 1.0000002f + 0.0002f * ((threadIdx.x >> 3) & 7);
+
+    float acc[N_ACC], a[N_ACC], b[N_ACC];
+    #pragma unroll
+    for (int i = 0; i < N_ACC; ++i) {
+        acc[i] = 0.1f * (i + 1);
+        a[i] = 1.0000001f + 0.0001f * (threadIdx.x & 7) + i;
+        b[i] = 1.0000002f + 0.0002f * ((threadIdx.x >> 3) & 7) + i;
+    }
+
+    for (int r = 0; r < inner_reps; ++r) {
+        #pragma unroll
+        for (int i = 0; i < N_ACC; ++i) {
+            // force FMA on CUDA cores
+            // asm volatile("fma.rn.f32 %0, %1, %2, %0;"
+            //              : "+f"(acc[i]) : "f"(a[i]), "f"(b[i]));
+            acc[i] += a[i] * b[i];
+        }
+    }
+
+    float total = 0.f;
+    #pragma unroll
+    for (int i = 0; i < N_ACC; ++i) total += acc[i];
+
+    if (total == -1.f) sink[blockIdx.x] = total;
+}
+
+template <int N_ACC>
+static double cuda_core_fp32_one(int smCount,
+                                 int maxThreadsPerSm,
+                                 cudaEvent_t t0,
+                                 cudaEvent_t t1) {
+    const int threads           = CC_THREADS;
+    const int max_blocks_per_sm = maxThreadsPerSm / threads;
+
+    double best = 0.0;
+
+    for (int bps = 1; bps <= max_blocks_per_sm; ++bps) {
+        const int blocks = smCount * bps;
+
+        float* d_sink = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_sink, static_cast<size_t>(blocks) * sizeof(float)));
+
+        cuda_core_fp32_kernel<N_ACC><<<blocks, threads>>>(d_sink, CC_INNER);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        CUDA_CHECK(cudaEventRecord(t0));
+        for (int r = 0; r < CC_OUTER; ++r) {
+            cuda_core_fp32_kernel<N_ACC><<<blocks, threads>>>(d_sink, CC_INNER);
+        }
+        CUDA_CHECK(cudaEventRecord(t1));
+        CUDA_CHECK(cudaEventSynchronize(t1));
+
+        float ms = 0.f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
+
+        double flops =
+            static_cast<double>(blocks) *
+            threads *
+            N_ACC *
+            CC_INNER *
+            2.0 *          // one FFMA = 2 FLOPs
+            CC_OUTER;
+
+        double tflops = flops / 1e12 / (ms / 1e3);
+        best = std::max(best, tflops);
+
+        CUDA_CHECK(cudaFree(d_sink));
+    }
+
+    return best;
+}
+
+double measure_cuda_core_fp32_tflops(int smCount, int maxThreadsPerSm) {
+    cudaEvent_t t0, t1;
+    CUDA_CHECK(cudaEventCreate(&t0));
+    CUDA_CHECK(cudaEventCreate(&t1));
+
+    double best = 0.0;
+    best = std::max(best, cuda_core_fp32_one<1 >(smCount, maxThreadsPerSm, t0, t1));
+    best = std::max(best, cuda_core_fp32_one<2 >(smCount, maxThreadsPerSm, t0, t1));
+    best = std::max(best, cuda_core_fp32_one<4 >(smCount, maxThreadsPerSm, t0, t1));
+    best = std::max(best, cuda_core_fp32_one<8 >(smCount, maxThreadsPerSm, t0, t1));
+    best = std::max(best, cuda_core_fp32_one<16>(smCount, maxThreadsPerSm, t0, t1));
+
+    CUDA_CHECK(cudaEventDestroy(t0));
+    CUDA_CHECK(cudaEventDestroy(t1));
+    return best;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // public API
 // ─────────────────────────────────────────────────────────────────────────────
 void print_device_info(int dev) {
@@ -503,6 +636,8 @@ void print_device_info(int dev) {
         static_cast<double>(p.memoryClockRate) * 1e3 *
         (p.memoryBusWidth / 8.0) *
         2.0 / 1e9;
+    double peak_cuda_core_fp32_tflops = estimate_cuda_core_fp32_peak_tflops(p);
+    double peak_smem_GBs              = estimate_smem_peak_GBs(p);
 
     printf("══════════════════════════════════════════════════════\n");
     printf("  Device %d: %s  (Compute %d.%d)\n", dev, p.name, p.major, p.minor);
@@ -576,6 +711,22 @@ void print_device_info(int dev) {
         printf("  skipped: FP16 WMMA requires Volta or newer GPU\n");
     }
 
+    printf("\n── CUDA Core FP32 ───────────────────────────────────────\n");
+    if (peak_cuda_core_fp32_tflops > 0.0) {
+        printf("  Peak FP32 (theor): %.1f TFLOPS\n", peak_cuda_core_fp32_tflops);
+    } else {
+        printf("  Peak FP32 (theor): unknown arch mapping\n");
+    }
+
+    printf("  FP32 (measured)   ... "); fflush(stdout);
+    printf("%.1f TFLOPS\n",
+           measure_cuda_core_fp32_tflops(p.multiProcessorCount,
+                                         p.maxThreadsPerMultiProcessor));
+
+    printf("\n── Shared Memory BW ────────────────────────────────────\n");
+    printf("  Peak BW (theor)   : %.1f GB/s  (%.2f TB/s)\n",
+           peak_smem_GBs, peak_smem_GBs / 1e3);
+
     printf("══════════════════════════════════════════════════════\n\n");
 }
 
@@ -583,8 +734,6 @@ void print_device_info(int dev) {
 // main
 // ─────────────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
-    CUDA_CHECK(cudaSetDevice(3));
-
     int device_count = 0;
     CUDA_CHECK(cudaGetDeviceCount(&device_count));
 
@@ -593,7 +742,7 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    int dev = 0;
+    int dev = 3; // 设置 CUDA 设备号
     if (argc >= 2) {
         dev = std::atoi(argv[1]);
     }
