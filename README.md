@@ -1,3 +1,57 @@
+## Roofline
+
+```bash
+══════════════════════════════════════════════════════
+  Device 3: NVIDIA GeForce RTX 4090  (Compute 8.9)
+══════════════════════════════════════════════════════
+
+── SM count ────────────────────────────────────────────
+  Multiprocessors : 128
+  Max threads/SM  : 1536
+  Max threads/blk : 1024
+  Warp size       : 32
+
+── Registers ──────────────────────────────────────────
+  Per SM          : 65536
+  Per thread block: 65536
+  Per thread (SM) : 42
+  Per thread (blk): 64
+
+── Shared Memory ──────────────────────────────────────
+  Per SM          : 100 KB
+  Per thread block: 48 KB
+  Per thread (SM) : 16.67 floats
+  Per thread (blk): 12.00 floats
+
+── Global Memory ───────────────────────────────────────
+  Total           : 23.6 GB
+  Memory clock    : 10501 MHz
+  Bus width       : 384 bit
+  Peak BW (theor) : 1008.1 GB/s
+
+── Bandwidth (measured) ────────────────────────────────
+  gmem read         ... 926.9 GB/s
+  gmem write        ... 921.3 GB/s
+  smem (baseline)   ... 19095.0 GB/s
+  smem (ILP+sweep)  ... 22327.3 GB/s
+
+── Tensor Core TF32 (measured) ─────────────────────────
+  TF32 (ILP+sweep) ... 89.7 TFLOPS
+
+── Tensor Core FP16 (measured) ─────────────────────────
+  FP16 (ILP+sweep) ... 179.7 TFLOPS
+
+── CUDA Core FP32 ───────────────────────────────────────
+  Peak FP32 (theor): 82.6 TFLOPS
+  FP32 (measured)   ... 78.8 TFLOPS
+
+── Shared Memory BW ────────────────────────────────────
+  Peak BW (theor)   : 41287.7 GB/s  (41.29 TB/s)
+══════════════════════════════════════════════════════
+```
+
+
+
 ## SGEMM
 
 ```bash
