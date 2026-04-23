@@ -184,6 +184,21 @@ Best kernel: online_softmax3 (0.048394 ms)
 
 
 
+## PrefixSum
+
+```bash
+===============================================================
+Inclusive Scan Benchmark (end-to-end pipeline timing)
+n = 1048576
+===============================================================
+Kogge-Stone (in-place) avg_ms=0.191138 res=PASS max_abs_err=5.625000 max_rel_err=0.000013
+Kogge-Stone (2-buffer) avg_ms=0.180888 res=PASS max_abs_err=5.625000 max_rel_err=0.000013
+Blelloch-Scan          avg_ms=0.173792 res=PASS max_abs_err=5.656250 max_rel_err=0.000013
+===============================================================
+```
+
+
+
 ## TopK
 
 ```bash

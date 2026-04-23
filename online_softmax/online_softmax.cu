@@ -676,8 +676,8 @@ int main() {
     constexpr int N = 128;
     constexpr int C = 8192;
     constexpr int THREADS = 512;
-    constexpr int WARMUP_ITERS = 5;
-    constexpr int BENCH_ITERS = 5;
+    constexpr int WARMUP_ITERS = 20;
+    constexpr int BENCH_ITERS = 200;
     constexpr int KERNEL_NUM = 8;
 
     static_assert((THREADS % 32) == 0, "THREADS must be a multiple of 32.");

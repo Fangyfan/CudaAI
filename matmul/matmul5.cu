@@ -190,7 +190,7 @@ int main() {
             cudaDeviceSynchronize();
 
             // cublas gemm kernel launch
-            int repeat_times = 5;
+            int repeat_times = 50;
             float cublas_time_ms = 0.0f;
             checkCudaError(cudaEventRecord(start), "cublas cudaEventRecord(start) failed");
             for (int i = 0; i < repeat_times; ++i) {
@@ -215,7 +215,7 @@ int main() {
             // 每个 Warp 负责计算 C 矩阵的一个中 tile: 64 × 64
             constexpr int WM = 64;
             constexpr int WN = 64;
-            constexpr int WN_ITER = 4;
+            constexpr int WN_ITER = 2;
             // 每个 thread 计算 C 矩阵中的一个小 tile: 8 × 4
             constexpr int TM = 8;
             constexpr int TN = 4;

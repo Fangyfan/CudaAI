@@ -1,6 +1,19 @@
 #include <cuda_runtime.h>
 #include <vector>
 #include <iostream>
+#include <iomanip>
+#include <cmath>
+#include <cstdlib>
+
+#define CHECK_CUDA(call)                                                       \
+    do {                                                                       \
+        cudaError_t err = (call);                                              \
+        if (err != cudaSuccess) {                                              \
+            std::cerr << "CUDA Error: " << cudaGetErrorString(err)            \
+                      << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
+            std::exit(EXIT_FAILURE);                                           \
+        }                                                                      \
+    } while (0)
 
 __global__ void kogge_stone_scan1(float* in, float* out, float* sum, int n) {
     extern __shared__ float T[];
@@ -178,196 +191,218 @@ __global__ void work_efficient_add_sums(float* out, float* sums) {
     out[offset + 2 * i + 1] += add_val;
 }
 
-void benchmark1(std::vector<float>& h_in);
-void benchmark2(std::vector<float>& h_in);
-int main() {
+struct VerifyResult {
+    bool passed;
+    float max_abs_err;
+    float max_rel_err;
+    int max_err_idx;
+};
+
+struct BenchmarkResult {
+    const char* name;
+    float avg_ms;
+    VerifyResult verify;
+};
+
+static std::vector<float> make_reference(const std::vector<float>& h_in) {
+    std::vector<float> h_ref(h_in.size());
+    for (size_t i = 0; i < h_in.size(); ++i) {
+        h_ref[i] = h_in[i];
+        if (i) h_ref[i] += h_ref[i - 1];
+    }
+    return h_ref;
+}
+
+static VerifyResult verify_output(const std::vector<float>& h_ref,
+                                  const std::vector<float>& h_out,
+                                  float rel_tol = 1e-4f,
+                                  float abs_tol = 1e-6f) {
+    VerifyResult result{true, 0.0f, 0.0f, -1};
+    for (size_t i = 0; i < h_ref.size(); ++i) {
+        float ref = h_ref[i];
+        float val = h_out[i];
+        float abs_err = std::fabs(val - ref);
+        float rel_err = abs_err / (std::fabs(ref) + 1e-7f);
+        if (abs_err > result.max_abs_err || rel_err > result.max_rel_err) {
+            result.max_abs_err = abs_err;
+            result.max_rel_err = rel_err;
+            result.max_err_idx = static_cast<int>(i);
+        }
+        if (abs_err > abs_tol && rel_err > rel_tol) {
+            result.passed = false;
+        }
+    }
+    return result;
+}
+
+template <typename LaunchFunc>
+float benchmark_cuda(LaunchFunc launch, int warmup_iters, int bench_iters) {
+    for (int i = 0; i < warmup_iters; ++i) {
+        launch();
+        CHECK_CUDA(cudaGetLastError());
+    }
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    CHECK_CUDA(cudaEventRecord(start));
+    for (int i = 0; i < bench_iters; ++i) {
+        launch();
+    }
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+    CHECK_CUDA(cudaGetLastError());
+
+    float total_ms = 0.0f;
+    CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+
+    return total_ms / bench_iters;
+}
+
+void print_result(const BenchmarkResult& result) {
+    std::cout << std::fixed << std::setprecision(6);
+    std::cout << std::left << std::setw(22) << result.name
+              << " avg_ms=" << std::setw(8) << result.avg_ms
+              << " res=" << std::setw(4) << (result.verify.passed ? "PASS" : "FAIL")
+              << " max_abs_err=" << std::setw(8) << result.verify.max_abs_err
+              << " max_rel_err=" << std::setw(8) << result.verify.max_rel_err
+              << std::endl;
+}
+
+BenchmarkResult benchmark1(const std::vector<float>& h_in, const std::vector<float>& h_ref) {
+    constexpr int n = 1024 * 1024;
+    constexpr int thread_num = 1024;
+    constexpr int block_num = n / thread_num;
+    constexpr int warmup_iters = 10;
+    constexpr int bench_iters = 50;
+
+    std::vector<float> h_out(n);
+
+    float* d_in = nullptr;
+    float* d_sum = nullptr;
+    float* d_out = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_in, n * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_sum, block_num * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_out, n * sizeof(float)));
+    CHECK_CUDA(cudaMemcpy(d_in, h_in.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+
+    auto launch = [&]() {
+        kogge_stone_scan1<<<block_num, thread_num, thread_num * sizeof(float)>>>(d_in, d_out, d_sum, n);
+        kogge_stone_scan2<<<1, block_num, block_num * sizeof(float)>>>(d_sum, d_sum, block_num);
+        kogge_stone_add_sums<<<block_num, thread_num>>>(d_out, d_sum, n);
+    };
+
+    float avg_ms = benchmark_cuda(launch, warmup_iters, bench_iters);
+
+    CHECK_CUDA(cudaMemcpy(h_out.data(), d_out, n * sizeof(float), cudaMemcpyDeviceToHost));
+    VerifyResult verify = verify_output(h_ref, h_out);
+
+    CHECK_CUDA(cudaFree(d_in));
+    CHECK_CUDA(cudaFree(d_out));
+    CHECK_CUDA(cudaFree(d_sum));
+
+    return {"Kogge-Stone (in-place)", avg_ms, verify};
+}
+
+BenchmarkResult benchmark2(const std::vector<float>& h_in, const std::vector<float>& h_ref) {
+    constexpr int n = 1024 * 1024;
+    constexpr int thread_num = 1024;
+    constexpr int block_num = n / thread_num;
+    constexpr int warmup_iters = 10;
+    constexpr int bench_iters = 50;
+
+    std::vector<float> h_out(n);
+
+    float* d_in = nullptr;
+    float* d_sum = nullptr;
+    float* d_out = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_in, n * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_sum, block_num * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_out, n * sizeof(float)));
+    CHECK_CUDA(cudaMemcpy(d_in, h_in.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+
+    auto launch = [&]() {
+        kogge_stone_scan11<<<block_num, thread_num, 2 * thread_num * sizeof(float)>>>(d_in, d_out, d_sum, n);
+        kogge_stone_scan22<<<1, block_num, 2 * block_num * sizeof(float)>>>(d_sum, d_sum, block_num);
+        kogge_stone_add_sums<<<block_num, thread_num>>>(d_out, d_sum, n);
+    };
+
+    float avg_ms = benchmark_cuda(launch, warmup_iters, bench_iters);
+
+    CHECK_CUDA(cudaMemcpy(h_out.data(), d_out, n * sizeof(float), cudaMemcpyDeviceToHost));
+    VerifyResult verify = verify_output(h_ref, h_out);
+
+    CHECK_CUDA(cudaFree(d_in));
+    CHECK_CUDA(cudaFree(d_out));
+    CHECK_CUDA(cudaFree(d_sum));
+
+    return {"Kogge-Stone (2-buffer)", avg_ms, verify};
+}
+
+BenchmarkResult benchmark3(const std::vector<float>& h_in, const std::vector<float>& h_ref) {
     constexpr int n = 1024 * 1024;
     constexpr int thread_num = 512;
     constexpr int element_num = 2 * thread_num;
     constexpr int block_num = n / element_num;
-    
+    constexpr int warmup_iters = 10;
+    constexpr int bench_iters = 50;
+
+    std::vector<float> h_out(n);
+
+    float* d_in = nullptr;
+    float* d_sum = nullptr;
+    float* d_out = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_in, n * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_sum, block_num * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_out, n * sizeof(float)));
+    CHECK_CUDA(cudaMemcpy(d_in, h_in.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+
+    auto launch = [&]() {
+        work_efficient_scan1<<<block_num, thread_num, element_num * sizeof(float)>>>(d_in, d_out, d_sum);
+        work_efficient_scan2<<<1, block_num / 2, block_num * sizeof(float)>>>(d_sum, d_sum, block_num);
+        work_efficient_add_sums<<<block_num, thread_num>>>(d_out, d_sum);
+    };
+
+    float avg_ms = benchmark_cuda(launch, warmup_iters, bench_iters);
+
+    CHECK_CUDA(cudaMemcpy(h_out.data(), d_out, n * sizeof(float), cudaMemcpyDeviceToHost));
+    VerifyResult verify = verify_output(h_ref, h_out);
+
+    CHECK_CUDA(cudaFree(d_in));
+    CHECK_CUDA(cudaFree(d_out));
+    CHECK_CUDA(cudaFree(d_sum));
+
+    return {"Blelloch-Scan", avg_ms, verify};
+}
+
+int main() {
+    constexpr int n = 1024 * 1024;
+
     std::vector<float> h_in(n);
-    std::vector<float> h_ref(n);
-    std::vector<float> h_out(n);
-    
+    std::srand(123);
     for (int i = 0; i < n; ++i) {
-        h_in[i] = (float)rand() / RAND_MAX;
-        h_ref[i] = h_in[i];
-        if (i) h_ref[i] += h_ref[i - 1];
-    }
-    benchmark1(h_in);
-    benchmark2(h_in);
-    
-    float* d_in;
-    float* d_sum;
-    float* d_out;
-    cudaMalloc(&d_in, n * sizeof(float));
-    cudaMalloc(&d_sum, block_num * sizeof(float));
-    cudaMalloc(&d_out, n * sizeof(float));
-    cudaMemcpy(d_in, h_in.data(), n * sizeof(float), cudaMemcpyHostToDevice);
-
-    cudaEvent_t start, end;
-    cudaEventCreate(&start);
-    cudaEventCreate(&end);
-
-    for (int i = 0; i < 10; ++i) {
-        work_efficient_scan1<<<block_num, thread_num, element_num * sizeof(float)>>>(d_in, d_out, d_sum);
-        work_efficient_scan2<<<1, block_num / 2, block_num * sizeof(float)>>>(d_sum, d_sum, block_num);
-        work_efficient_add_sums<<<block_num, thread_num>>>(d_out, d_sum);
+        h_in[i] = static_cast<float>(std::rand()) / RAND_MAX;
     }
 
-    cudaEventRecord(start);
-    for (int i = 0; i < 10; ++i) {
-        work_efficient_scan1<<<block_num, thread_num, element_num * sizeof(float)>>>(d_in, d_out, d_sum);
-        work_efficient_scan2<<<1, block_num / 2, block_num * sizeof(float)>>>(d_sum, d_sum, block_num);
-        work_efficient_add_sums<<<block_num, thread_num>>>(d_out, d_sum);
-    }
-    cudaEventRecord(end);
-    cudaEventSynchronize(end);
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, end);
+    std::vector<float> h_ref = make_reference(h_in);
 
-    cudaMemcpy(h_out.data(), d_out, n * sizeof(float), cudaMemcpyDeviceToHost);
-    for (int i = 0; i < n; ++i) {
-        float val = h_out[i];
-        float ref = h_ref[i];
-        float diff = fabsf(val - ref);
-        float rel_err = diff / (fabsf(ref) + 1e-7);
-        if (rel_err > 1e-4) {
-            std::cout << "Error at index " << i << ": Expected " << ref << ", Got " << val << std::endl;
-            return 1;
-        }
-    }
-    std::cout << "Work efficient prefix sum kernel execution time: " << milliseconds / 10 << " ms" << std::endl;
+    BenchmarkResult r1 = benchmark1(h_in, h_ref);
+    BenchmarkResult r2 = benchmark2(h_in, h_ref);
+    BenchmarkResult r3 = benchmark3(h_in, h_ref);
 
-    cudaEventDestroy(start);
-    cudaEventDestroy(end);
-    cudaFree(d_in);
-    cudaFree(d_out);
-    cudaFree(d_sum);
+    std::cout << "===============================================================\n";
+    std::cout << "Inclusive Scan Benchmark (end-to-end pipeline timing)\n";
+    std::cout << "n = " << n << "\n";
+    std::cout << "===============================================================\n";
+    print_result(r1);
+    print_result(r2);
+    print_result(r3);
+    std::cout << "===============================================================\n";
+
     return 0;
-}
-
-void benchmark1(std::vector<float>& h_in) {
-    constexpr int n = 1024 * 1024;
-    constexpr int thread_num = 1024;
-    constexpr int block_num = n / thread_num;
-
-    std::vector<float> h_ref(n);
-    std::vector<float> h_out(n);
-
-    for (int i = 0; i < n; ++i) {
-        h_ref[i] = h_in[i];
-        if (i) h_ref[i] += h_ref[i - 1];
-    }
-
-    float* d_in;
-    float* d_sum;
-    float* d_out;
-    cudaMalloc(&d_in, n * sizeof(float));
-    cudaMalloc(&d_sum, block_num * sizeof(float));
-    cudaMalloc(&d_out, n * sizeof(float));
-    cudaMemcpy(d_in, h_in.data(), n * sizeof(float), cudaMemcpyHostToDevice);
-
-    cudaEvent_t start, end;
-    cudaEventCreate(&start);
-    cudaEventCreate(&end);
-
-    for (int i = 0; i < 10; ++i) {
-        kogge_stone_scan1<<<block_num, thread_num, thread_num * sizeof(float)>>>(d_in, d_out, d_sum, n);
-        kogge_stone_scan2<<<1, block_num, block_num * sizeof(float)>>>(d_sum, d_sum, block_num);
-        kogge_stone_add_sums<<<block_num, thread_num>>>(d_out, d_sum, n);
-    }
-
-    cudaEventRecord(start);
-    for (int i = 0; i < 10; ++i) {
-        kogge_stone_scan1<<<block_num, thread_num, thread_num * sizeof(float)>>>(d_in, d_out, d_sum, n);
-        kogge_stone_scan2<<<1, block_num, block_num * sizeof(float)>>>(d_sum, d_sum, block_num);
-        kogge_stone_add_sums<<<block_num, thread_num>>>(d_out, d_sum, n);
-    }
-    cudaEventRecord(end);
-    cudaEventSynchronize(end);
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, end);
-
-    cudaMemcpy(h_out.data(), d_out, n * sizeof(float), cudaMemcpyDeviceToHost);
-    for (int i = 0; i < n; ++i) {
-        float val = h_out[i];
-        float ref = h_ref[i];
-        float diff = fabsf(val - ref);
-        float rel_err = diff / (fabsf(ref) + 1e-7);
-        if (rel_err > 1e-4) {
-            std::cout << "Error at index " << i << ": Expected " << ref << ", Got " << val << std::endl;
-            return;
-        }
-    }
-    std::cout << "Kogge stone (in-place) prefix sum kernel execution time: " << milliseconds / 10 << " ms" << std::endl;
-
-    cudaEventDestroy(start);
-    cudaEventDestroy(end);
-    cudaFree(d_in);
-    cudaFree(d_out);
-    cudaFree(d_sum);
-}
-
-void benchmark2(std::vector<float>& h_in) {
-    constexpr int n = 1024 * 1024;
-    constexpr int thread_num = 1024;
-    constexpr int block_num = n / thread_num;
-
-    std::vector<float> h_ref(n);
-    std::vector<float> h_out(n);
-
-    for (int i = 0; i < n; ++i) {
-        h_ref[i] = h_in[i];
-        if (i) h_ref[i] += h_ref[i - 1];
-    }
-
-    float* d_in;
-    float* d_sum;
-    float* d_out;
-    cudaMalloc(&d_in, n * sizeof(float));
-    cudaMalloc(&d_sum, block_num * sizeof(float));
-    cudaMalloc(&d_out, n * sizeof(float));
-    cudaMemcpy(d_in, h_in.data(), n * sizeof(float), cudaMemcpyHostToDevice);
-
-    cudaEvent_t start, end;
-    cudaEventCreate(&start);
-    cudaEventCreate(&end);
-
-    for (int i = 0; i < 10; ++i) {
-        kogge_stone_scan11<<<block_num, thread_num, 2 * thread_num * sizeof(float)>>>(d_in, d_out, d_sum, n);
-        kogge_stone_scan22<<<1, block_num, 2 * block_num * sizeof(float)>>>(d_sum, d_sum, block_num);
-        kogge_stone_add_sums<<<block_num, thread_num>>>(d_out, d_sum, n);
-    }
-
-    cudaEventRecord(start);
-    for (int i = 0; i < 10; ++i) {
-        kogge_stone_scan11<<<block_num, thread_num, 2 * thread_num * sizeof(float)>>>(d_in, d_out, d_sum, n);
-        kogge_stone_scan22<<<1, block_num, 2 * block_num * sizeof(float)>>>(d_sum, d_sum, block_num);
-        kogge_stone_add_sums<<<block_num, thread_num>>>(d_out, d_sum, n);
-    }
-    cudaEventRecord(end);
-    cudaEventSynchronize(end);
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, end);
-
-    cudaMemcpy(h_out.data(), d_out, n * sizeof(float), cudaMemcpyDeviceToHost);
-    for (int i = 0; i < n; ++i) {
-        float val = h_out[i];
-        float ref = h_ref[i];
-        float diff = fabsf(val - ref);
-        float rel_err = diff / (fabsf(ref) + 1e-7);
-        if (rel_err > 1e-4) {
-            std::cout << "Error at index " << i << ": Expected " << ref << ", Got " << val << std::endl;
-            return;
-        }
-    }
-    std::cout << "Kogge stone (double-buffer) prefix sum kernel execution time: " << milliseconds / 10 << " ms" << std::endl;
-
-    cudaEventDestroy(start);
-    cudaEventDestroy(end);
-    cudaFree(d_in);
-    cudaFree(d_out);
-    cudaFree(d_sum);
 }
