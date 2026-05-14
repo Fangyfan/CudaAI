@@ -137,7 +137,8 @@ std::vector<int> generate() {
 
 int main() {
     // std::vector<int> sizes = generate();
-    std::vector<int> sizes = {128, 256, 512, 1024, 2048, 4096};
+    // std::vector<int> sizes = {128, 256, 512, 1024, 2048, 4096};
+    std::vector<int> sizes = {4096};
 
     // 打开 csv 文件
     std::ofstream ofs("sgemm_benchmark_v6.csv");
@@ -182,7 +183,7 @@ int main() {
             checkCudaError(cudaEventCreate(&end), "cudaEventCreate(end) failed");
 
             // warm up
-            int warmup_times = 10;
+            int warmup_times = 5;
             for (int i = 0; i < warmup_times; ++i) {
                 checkCublasError(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha, d_B, N, d_A, N, &beta, d_C_v6, N), 
                                 "warm up cublasSgemm failed");
@@ -190,7 +191,7 @@ int main() {
             cudaDeviceSynchronize();
 
             // cublas gemm kernel launch
-            int repeat_times = 50;
+            int repeat_times = 10;
             float cublas_time_ms = 0.0f;
             checkCudaError(cudaEventRecord(start), "cublas cudaEventRecord(start) failed");
             for (int i = 0; i < repeat_times; ++i) {

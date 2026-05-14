@@ -590,11 +590,10 @@ __global__ void online_softmax_kernel(const float* __restrict__ input, float* __
     const float4* in4 = reinterpret_cast<const float4*>(input);
     for (int i = threadIdx.x; i < pack_num; i += blockDim.x) {
         float4 v = in4[i];
-        md_temp[0].m = v.x; md_temp[1].m = v.y;
-        md_temp[2].m = v.z; md_temp[3].m = v.w;
-
-        md_temp[0].d = 1.0f; md_temp[1].d = 1.0f;
-        md_temp[2].d = 1.0f; md_temp[3].d = 1.0f;
+        md_temp[0] = {v.x, 1.0f};
+        md_temp[1] = {v.y, 1.0f};
+        md_temp[2] = {v.z, 1.0f};
+        md_temp[3] = {v.w, 1.0f};
 
         md_val = merge(md_val, md_temp[0]);
         md_val = merge(md_val, md_temp[1]);
