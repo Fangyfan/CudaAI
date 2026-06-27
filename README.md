@@ -52,6 +52,66 @@
 
 
 
+## BF16 GEMM
+
+```bash
+M = 4096, N = 4096, K = 4096
+A bytes: 32 MiB
+B bytes: 32 MiB
+C bytes: 32 MiB
+
+Custom kernel:
+  best ms  = 0.8640
+  avg  ms  = 0.9098
+  best TFLOPS = 159.0710
+  avg  TFLOPS = 151.0632
+
+cuBLAS BF16 GEMM:
+  best ms  = 0.8859
+  avg  ms  = 0.8893
+  best TFLOPS = 155.1363
+  avg  TFLOPS = 154.5475
+
+Accuracy vs cuBLAS:
+  max_abs  = 0.1250
+  max_rel  = 0.0078
+  mean_abs = 0.0000
+  rmse     = 0.0006
+  bad      = 0 / 16777216  with abs_tol=0.2500, rel_tol=0.0200
+
+PASS
+```
+
+```bash
+M = 4096, N = 16384, K = 4096
+A bytes: 32 MiB
+B bytes: 128 MiB
+C bytes: 128 MiB
+
+Custom kernel:
+  best ms  = 3.4250
+  avg  ms  = 3.4592
+  best TFLOPS = 160.5104
+  avg  TFLOPS = 158.9249
+
+cuBLAS BF16 GEMM:
+  best ms  = 3.6537
+  avg  ms  = 3.7276
+  best TFLOPS = 150.4658
+  avg  TFLOPS = 147.4832
+
+Accuracy vs cuBLAS:
+  max_abs  = 0.1250
+  max_rel  = 0.0078
+  mean_abs = 0.0000
+  rmse     = 0.0006
+  bad      = 0 / 67108864  with abs_tol=0.2500, rel_tol=0.0200
+
+PASS
+```
+
+
+
 ## SGEMM
 
 ```bash

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.18)
 project(CUDA_Project)
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_CXX_FLAGS "-O3 ${CMAKE_CXX_FLAGS}")
@@ -25,3 +25,4 @@ add_subdirectory(online_softmax)
 add_subdirectory(topk)
 add_subdirectory(sgemm)
 add_subdirectory(argmax)
+add_subdirectory(sm89_bf16_gemm)
